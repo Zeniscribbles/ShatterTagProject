@@ -31,7 +31,6 @@ Supports:
 ```bash
 # Clone the repo
 git clone https://github.com/yourusername/stegastamp-robust.git
-cd stegastamp-robust
 
 # Install dependencies
 pip install -r requirements.txt
