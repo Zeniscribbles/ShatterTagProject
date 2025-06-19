@@ -1,3 +1,38 @@
+"""
+train_cifar10.py
+
+Main training script for the StegaFrag watermarking framework.
+
+This script trains a convolutional encoder-decoder pair to embed and recover binary fingerprints
+(aka watermarks) from RGB images. The system is designed to support both robust watermarking 
+(for ownership verification) and future extensions toward fragile watermarking 
+(for tamper detection and image integrity).
+
+Key Features:
+-------------
+- Dataset-agnostic training (supports arbitrary image folders)
+- Configurable loss weights, logging intervals, and batch sizes via argparse
+- Modular encoder/decoder architecture (see models.py)
+- TensorBoard logging and periodic checkpointing
+- Compatible with Google Colab or local execution
+
+Typical Use Case:
+-----------------
+Use this script to train an encoder and decoder pair on your dataset.
+The encoder embeds binary fingerprints into images, while the decoder learns to recover them.
+
+Future Direction:
+-----------------
+This framework will be extended to support fragile watermarking where 
+minor image tampering breaks fingerprint recoverability — useful for tamper detection.
+
+Usage:
+------
+python train_cifar10.py --data_dir ./images --output_dir ./output --image_resolution 128 --bit_length 64
+
+Author: Amanda + Chansen
+"""
+
 import argparse
 import glob
 import os
