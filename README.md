@@ -1,6 +1,6 @@
 # Shatter Tag Project
 
-Project Overview
+Project Overview:
 This project is a fully reworked and generalized watermarking framework derived from StegaStamp, designed for embedding imperceptible binary fingerprints into images. Unlike traditional watermarking tools focused solely on robustness, our system is being adapted for controlled fragility — enabling it to act as a tamper seal in addition to traditional ownership verification.
 
 We began by stripping out unnecessary diffusion model dependencies and hardcoded CIFAR-specific logic. What emerged is a clean, modular, Colab-compatible pipeline for:
