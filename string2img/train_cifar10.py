@@ -1,0 +1,273 @@
+import argparse
+import glob
+import os
+from os.path import join
+from datetime import datetime
+from time import time
+
+import PIL
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
+from torchvision.utils import make_grid, save_image
+from torch.optim import Adam
+from tqdm import tqdm
+
+import models
+
+
+def generate_random_fingerprints(batch_size, bit_length):
+    """
+    Generate a binary fingerprint vector for each image in a batch.
+
+    Args:
+        batch_size (int): Number of samples in the batch.
+        bit_length (int): Number of bits per fingerprint.
+
+    Returns:
+        Tensor of shape (batch_size, bit_length) with binary values (0 or 1).
+    """
+    return torch.randint(0, 2, (batch_size, bit_length), dtype=torch.float)
+
+
+class CustomImageFolder(Dataset):
+    """
+    Dataset that loads all .png, .jpg, and .jpeg images from a directory recursively.
+    Applies specified torchvision transforms.
+    """
+    def __init__(self, data_dir, transform=None):
+        self.transform = transform
+        self.filenames = sorted(
+            glob.glob(os.path.join(data_dir, "**", "*.[pj][pn]g"), recursive=True)
+        )
+        if not self.filenames:
+            raise RuntimeError(f"No image files found in {data_dir}")
+
+    def __getitem__(self, idx):
+        filename = self.filenames[idx]
+        image = PIL.Image.open(filename).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        return image, 0
+
+    def __len__(self):
+        return len(self.filenames)
+
+
+def load_data(args):
+    """
+    Load image dataset and return a PyTorch DataLoader.
+
+    Args:
+        args (Namespace): Parsed command-line arguments.
+
+    Returns:
+        tuple: (dataset, dataloader)
+    """
+    transform = transforms.Compose([
+        transforms.Resize((args.image_resolution, args.image_resolution)),
+        transforms.ToTensor(),
+    ])
+
+    dataset = CustomImageFolder(args.data_dir, transform=transform)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        drop_last=True,
+    )
+
+    return dataset, dataloader
+
+
+def main(args):
+    """
+    Main training loop for StegaStamp encoder/decoder.
+
+    Args:
+        args (Namespace): Parsed command-line arguments.
+    """
+    LOGS_PATH = os.path.join(args.output_dir, "logs")
+    CHECKPOINTS_PATH = os.path.join(args.output_dir, "checkpoints")
+    SAVED_IMAGES = os.path.join(args.output_dir, "saved_images")
+
+    os.makedirs(LOGS_PATH, exist_ok=True)
+    os.makedirs(CHECKPOINTS_PATH, exist_ok=True)
+    os.makedirs(SAVED_IMAGES, exist_ok=True)
+
+    writer = SummaryWriter(LOGS_PATH)
+
+    dt_string = datetime.now().strftime("%d%m%Y_%H:%M:%S")
+    EXP_NAME = f"stegastamp_{args.bit_length}_{dt_string}"
+
+    device = torch.device(args.cuda if torch.cuda.is_available() else "cpu")
+    dataset, dataloader = load_data(args)
+    IMAGE_CHANNELS = 3
+
+    # Set up plot points for logging frequency
+    plot_points = list(range(0, args.num_epochs * 1000, args.log_interval))
+
+    encoder = models.StegaStampEncoder(
+        args.image_resolution,
+        IMAGE_CHANNELS,
+        args.bit_length,
+        return_residual=False,
+    ).to(device)
+
+    decoder = models.StegaStampDecoder(
+        args.image_resolution,
+        IMAGE_CHANNELS,
+        args.bit_length,
+    ).to(device)
+
+    decoder_encoder_optim = Adam(
+        params=list(decoder.parameters()) + list(encoder.parameters()), lr=args.lr
+    )
+
+    global_step = 0
+    steps_since_l2_loss_activated = -1
+
+    for i_epoch in range(args.num_epochs):
+        for images, _ in dataloader:
+            global_step += 1
+            batch_size = min(args.batch_size, images.size(0))
+
+            fingerprints = generate_random_fingerprints(
+                batch_size,
+                args.bit_length
+            ).to(device)
+
+            # Weight schedule for L2 loss
+            l2_loss_weight = min(
+                max(
+                    0,
+                    args.l2_loss_weight
+                    * (steps_since_l2_loss_activated - args.l2_loss_await)
+                    / args.l2_loss_ramp,
+                ),
+                args.l2_loss_weight,
+            )
+            BCE_loss_weight = args.BCE_loss_weight
+
+            clean_images = images.to(device)
+            fingerprinted_images = encoder(fingerprints, clean_images)
+            residual = fingerprinted_images - clean_images
+
+            decoder_output = decoder(fingerprinted_images)
+
+            # Compute loss
+            l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
+            BCE_loss = nn.BCEWithLogitsLoss()(decoder_output.view(-1), fingerprints.view(-1))
+            loss = l2_loss_weight * l2_loss + BCE_loss_weight * BCE_loss
+
+            encoder.zero_grad()
+            decoder.zero_grad()
+            loss.backward()
+            decoder_encoder_optim.step()
+
+            # Accuracy
+            fingerprints_predicted = (decoder_output > 0).float()
+            bitwise_accuracy = 1.0 - torch.mean(
+                torch.abs(fingerprints - fingerprints_predicted)
+            )
+
+            if steps_since_l2_loss_activated == -1 and bitwise_accuracy.item() > 0.9:
+                steps_since_l2_loss_activated = 0
+            elif steps_since_l2_loss_activated != -1:
+                steps_since_l2_loss_activated += 1
+
+            # Logging
+            if global_step in plot_points:
+                writer.add_scalar("bitwise_accuracy", bitwise_accuracy, global_step)
+                writer.add_scalar("loss", loss, global_step)
+                writer.add_scalar("BCE_loss", BCE_loss, global_step)
+                writer.add_scalars("clean_statistics", {
+                    "min": clean_images.min(),
+                    "max": clean_images.max()
+                }, global_step)
+                writer.add_scalars("with_fingerprint_statistics", {
+                    "min": fingerprinted_images.min(),
+                    "max": fingerprinted_images.max()
+                }, global_step)
+                writer.add_scalars("residual_statistics", {
+                    "min": residual.min(),
+                    "max": residual.max(),
+                    "mean_abs": residual.abs().mean()
+                }, global_step)
+
+                writer.add_image("clean_image", make_grid(clean_images, normalize=True), global_step)
+                writer.add_image("residual", make_grid(residual, normalize=True, scale_each=True), global_step)
+                writer.add_image("image_with_fingerprint", make_grid(fingerprinted_images, normalize=True), global_step)
+
+                save_image(fingerprinted_images, os.path.join(SAVED_IMAGES, f"{global_step}.png"), normalize=True)
+
+                writer.add_scalar("loss_weights/l2_loss_weight", l2_loss_weight, global_step)
+                writer.add_scalar("loss_weights/BCE_loss_weight", BCE_loss_weight, global_step)
+
+            # Checkpoint
+            if global_step % 5000 == 0:
+                torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_optim.pth"))
+                torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_encoder.pth"))
+                torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_decoder.pth"))
+                with open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w") as f:
+                    f.write(str(global_step))
+
+    print(f"\nTraining complete. Final step: {global_step}")
+    print(f"Checkpoints saved to: {CHECKPOINTS_PATH}")
+    print(f"Fingerprinted images saved to: {SAVED_IMAGES}")
+    print(f"Logs available for TensorBoard in: {LOGS_PATH}")
+
+    writer.export_scalars_to_json("./all_scalars.json")
+    writer.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train StegaStamp model for image watermarking.")
+
+    parser.add_argument("--data_dir", type=str, required=True, help="Path to image dataset.")
+    parser.add_argument("--image_resolution", type=int, default=32, help="Input image resolution (e.g., 32 for CIFAR).")
+    parser.add_argument("--output_dir", type=str, default="./output", help="Directory for logs/checkpoints/images.")
+    parser.add_argument("--bit_length", type=int, default=64, help="Length of the binary fingerprint vector.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Training batch size.")
+    parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--cuda", type=str, default="cuda", help="Device to use (e.g., 'cuda' or 'cpu').")
+
+    parser.add_argument(
+        "--l2_loss_weight", type=float, default=1.0,
+        help="Maximum weight for image reconstruction loss (MSE)."
+    )
+    parser.add_argument(
+        "--l2_loss_await", type=int, default=0,
+        help="Step at which to begin applying L2 loss."
+    )
+    parser.add_argument(
+        "--l2_loss_ramp", type=int, default=1000,
+        help="Number of steps over which L2 loss ramps up to full strength."
+    )
+    parser.add_argument(
+        "--BCE_loss_weight", type=float, default=1.0,
+        help="Weight for binary cross-entropy loss used for fingerprint decoding."
+    )
+
+    parser.add_argument(
+        "--log_interval", type=int, default=1000,
+        help="""Step interval for logging training images, scalars, and diagnostics.
+
+        Use a smaller value (e.g., 100 or 200) for:
+            - debugging early model behavior
+            - short training runs
+            - visualizing overfitting
+
+        Use a larger value (e.g., 1000 or 5000) for:
+            - long training runs
+            - reducing I/O overhead in Colab
+            - minimizing saved image/log size
+        """
+    )
+
+    args = parser.parse_args()
+    main(args)
