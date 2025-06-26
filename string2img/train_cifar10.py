@@ -166,7 +166,9 @@ def main(args):
     steps_since_l2_loss_activated = -1
 
     for i_epoch in range(args.num_epochs):
-        for images, _ in dataloader:
+        print(f"\nEpoch [{i_epoch + 1}/{args.num_epochs}]")
+        
+        for images, _ in tqdm(dataloader, desc=f"Training Step (Epoch {i_epoch + 1})", leave=False):
             global_step += 1
             batch_size = min(args.batch_size, images.size(0))
 
