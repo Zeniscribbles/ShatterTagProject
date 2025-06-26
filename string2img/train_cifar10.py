@@ -111,7 +111,7 @@ def load_data(args):
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=2, # 2 workers for google colab
         drop_last=True,
     )
 
@@ -167,7 +167,7 @@ def main(args):
 
     for i_epoch in range(args.num_epochs):
         print(f"\nEpoch [{i_epoch + 1}/{args.num_epochs}]")
-        
+
         for images, _ in tqdm(dataloader, desc=f"Training Step (Epoch {i_epoch + 1})", leave=False):
             global_step += 1
             batch_size = min(args.batch_size, images.size(0))
