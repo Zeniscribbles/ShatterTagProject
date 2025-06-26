@@ -72,23 +72,23 @@ class StegaStampEncoder(nn.Module):
         conv4 = relu(self.conv4(conv3))
         conv5 = relu(self.conv5(conv4))
 
-        up6 = relu(self.up6(self.upsample6(conv5)))
+        up6 = relu(self.up6(F.interpolate(conv5, size=conv4.shape[-2:], mode='bilinear', align_corners=False)))
         merge6 = torch.cat([conv4, up6], dim=1)
         conv6 = relu(self.conv6(merge6))
 
-        up7 = relu(self.up7(self.upsample7(conv6)))
+        up7 = relu(self.up7(F.interpolate(conv6, size=conv3.shape[-2:], mode='bilinear', align_corners=False)))
         merge7 = torch.cat([conv3, up7], dim=1)
         conv7 = relu(self.conv7(merge7))
 
-        up8 = relu(self.up8(self.upsample8(conv7)))
+        up8 = relu(self.up8(F.interpolate(conv7, size=conv2.shape[-2:], mode='bilinear', align_corners=False)))
         merge8 = torch.cat([conv2, up8], dim=1)
         conv8 = relu(self.conv8(merge8))
 
-        up9 = relu(self.up9(self.upsample9(conv8)))
+        up9 = relu(self.up9(F.interpolate(conv8, size=conv1.shape[-2:], mode='bilinear', align_corners=False)))
         merge9 = torch.cat([conv1, up9, inputs], dim=1)
         conv9 = relu(self.conv9(merge9))
         conv10 = relu(self.conv10(conv9))
-
+    
         residual = self.residual(conv10)
         if not self.return_residual:
             residual = sigmoid(residual)
