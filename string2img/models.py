@@ -39,19 +39,19 @@ class StegaStampEncoder(nn.Module):
         self.conv5 = nn.Conv2d(128, 256, 3, 2, 1)
 
         self.up6 = nn.Conv2d(256, 128, 2, 1, padding=1)
-        self.upsample6 = nn.Upsample(scale_factor=(2, 2))
+        self.upsample6 = nn.Upsample(scale_factor=(2, 2), mode='bilinear', align_corners=False)
         self.conv6 = nn.Conv2d(128 + 128, 128, 3, 1, 1)
 
         self.up7 = nn.Conv2d(128, 64, 2, 1, padding=1)
-        self.upsample7 = nn.Upsample(scale_factor=(2, 2))
+        self.upsample7 = nn.Upsample(scale_factor=(2, 2), mode='bilinear', align_corners=False)
         self.conv7 = nn.Conv2d(64 + 64, 64, 3, 1, 1)
 
         self.up8 = nn.Conv2d(64, 32, 2, 1, padding=1)
-        self.upsample8 = nn.Upsample(scale_factor=(2, 2))
+        self.upsample8 = nn.Upsample(scale_factor=(2, 2), mode='bilinear', align_corners=False)
         self.conv8 = nn.Conv2d(32 + 32, 32, 3, 1, 1)
 
         self.up9 = nn.Conv2d(32, 32, 2, 1, padding=1)
-        self.upsample9 = nn.Upsample(scale_factor=(2, 2))
+        self.upsample9 = nn.Upsample(scale_factor=(2, 2), mode='bilinear', align_corners=False)
         self.conv9 = nn.Conv2d(32 + 32 + 2 * IMAGE_CHANNELS, 32, 3, 1, 1)
 
         self.conv10 = nn.Conv2d(32, 32, 3, 1, 1)
