@@ -30,7 +30,10 @@ class StegaStampEncoder(nn.Module):
             fingerprint_size, self.encoded_size * self.encoded_size * IMAGE_CHANNELS
         )
 
-        self.fingerprint_upsample = nn.Upsample(scale_factor=(2 ** (log_resolution - 4), 2 ** (log_resolution - 4)))
+        self.fingerprint_upsample = nn.Upsample(
+            scale_factor=(2 ** (log_resolution - 4), 2 ** (log_resolution - 4)),
+            mode='bilinear', align_corners=False
+        )
 
         self.conv1 = nn.Conv2d(2 * IMAGE_CHANNELS, 32, 3, 1, 1)
         self.conv2 = nn.Conv2d(32, 32, 3, 2, 1)
