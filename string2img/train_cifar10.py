@@ -266,7 +266,6 @@ def main(args):
     print(f"Fingerprinted images saved to: {SAVED_IMAGES}")
     print(f"Logs available for TensorBoard in: {LOGS_PATH}")
 
-    writer.export_scalars_to_json("./all_scalars.json")
     writer.close()
 
 
