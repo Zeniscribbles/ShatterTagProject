@@ -182,7 +182,7 @@ def main(args):
             ).to(device)
 
             # Debug fingerprint/image shape before encoder
-            print("\n📦 DEBUG: Sending batch into encoder")
+            print("\nDEBUG: Sending batch into encoder")
             print(f"  ↳ fingerprints: {fingerprints.shape}")
             print(f"  ↳ clean_images: {images.shape}")
 
@@ -261,10 +261,10 @@ def main(args):
                 with open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w") as f:
                     f.write(str(global_step))
 
-    print(f"\n✅ Training complete. Final step: {global_step}")
-    print(f"📁 Checkpoints saved to: {CHECKPOINTS_PATH}")
-    print(f"🖼️  Fingerprinted images saved to: {SAVED_IMAGES}")
-    print(f"📊 Logs available for TensorBoard in: {LOGS_PATH}")
+    print(f"\nTraining complete. Final step: {global_step}")
+    print(f"Checkpoints saved to: {CHECKPOINTS_PATH}")
+    print(f"Fingerprinted images saved to: {SAVED_IMAGES}")
+    print(f"Logs available for TensorBoard in: {LOGS_PATH}")
 
     writer.export_scalars_to_json("./all_scalars.json")
     writer.close()
@@ -273,4 +273,25 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train StegaStamp model for image watermarking.")
 
-    parser.add_argument("--data_dir", type=str, required=True, help="Pat
+    parser.add_argument("--data_dir", type=str, required=True, help="Path to image dataset.")
+    parser.add_argument("--image_resolution", type=int, default=32, help="Input image resolution (e.g., 32 for CIFAR).")
+    parser.add_argument("--output_dir", type=str, default="./output", help="Directory for logs/checkpoints/images.")
+    parser.add_argument("--bit_length", type=int, default=64, help="Length of the binary fingerprint vector.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Training batch size.")
+    parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--cuda", type=str, default="cuda", help="Device to use (e.g., 'cuda' or 'cpu').")
+
+    parser.add_argument("--l2_loss_weight", type=float, default=1.0, help="Max weight for image reconstruction loss (MSE).")
+    parser.add_argument("--l2_loss_await", type=int, default=0, help="Step at which to begin applying L2 loss.")
+    parser.add_argument("--l2_loss_ramp", type=int, default=1000, help="Steps to ramp up L2 loss to full strength.")
+    parser.add_argument("--BCE_loss_weight", type=float, default=1.0, help="Weight for binary cross-entropy loss.")
+
+    parser.add_argument(
+        "--log_interval", type=int, default=1000,
+        help="Steps between logging diagnostics/images. Lower = more verbose."
+    )
+
+    args = parser.parse_args()
+    main(args)
+
