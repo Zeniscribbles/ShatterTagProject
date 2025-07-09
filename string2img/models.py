@@ -132,7 +132,7 @@ class StegaStampDecoder(nn.Module):
         IMAGE_CHANNELS (int): Number of image channels (e.g., 3 for RGB).
         fingerprint_size (int): Length of the fingerprint to recover.
     """
-    def __init__(self, resolution=32, IMAGE_CHANNELS=3, fingerprint_size=64S):
+    def __init__(self, resolution=32, IMAGE_CHANNELS=3, fingerprint_size=64):
         super(StegaStampDecoder, self).__init__()
         self.resolution = resolution
         self.IMAGE_CHANNELS = IMAGE_CHANNELS
