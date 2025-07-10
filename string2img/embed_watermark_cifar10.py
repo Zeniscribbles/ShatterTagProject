@@ -110,6 +110,15 @@ def load_models():
     RevealNet = RevealNet.to(device)
 
 def embed_fingerprints():
+    """
+    Embeds fingerprints into images using the trained StegaStamp encoder.
+    Optionally evaluates fingerprint recovery accuracy using the decoder.
+    Saves fingerprinted images and their associated fingerprints.
+
+    If `args.check` is enabled, bitwise accuracy is computed and displayed.
+    Additionally, optional grid visualizations for clean, fingerprinted, and
+    residual images are available for debugging, but commented out by default.
+    """
     all_fingerprinted_images = []
     all_fingerprints = []
 
@@ -148,6 +157,7 @@ def embed_fingerprints():
     all_fingerprinted_images = torch.cat(all_fingerprinted_images, dim=0).cpu()
     all_fingerprints = torch.cat(all_fingerprints, dim=0).cpu()
 
+    os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.output_dir_note, exist_ok=True)
 
     f = open(os.path.join(args.output_dir_note, "embedded_fingerprints.txt"), "w")
@@ -165,6 +175,16 @@ def embed_fingerprints():
         bitwise_accuracy /= len(all_fingerprints)
         print(f"Bitwise accuracy on fingerprinted images: {bitwise_accuracy}")
 
+        # Optional debugging output: uncomment to generate visualization grids.
+        # These show that the fingerprints are imperceptible to the human eye.
+
+        """
         save_image(images[:49], os.path.join(args.output_dir, "test_samples_clean.png"), nrow=7)
         save_image(fingerprinted_images[:49], os.path.join(args.output_dir, "test_samples_fingerprinted.png"), nrow=7)
-        save_image(torch.abs(images - fingerprinted_images)[:49], os.path.join(args.output_dir, "test_samples_residual.png"), normalize=True, nrow=7)
+        save_image(
+            torch.abs(images - fingerprinted_images)[:49],
+            os.path.join(args.output_dir, "test_samples_residual.png"),
+            normalize=True,
+            nrow=7
+        )
+        """
