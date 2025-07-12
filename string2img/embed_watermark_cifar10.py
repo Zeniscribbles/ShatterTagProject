@@ -114,66 +114,59 @@ def embed_fingerprints():
     Embeds fingerprints into images using the trained StegaStamp encoder.
     Optionally evaluates fingerprint recovery accuracy using the decoder.
     Saves fingerprinted images and their associated fingerprints.
-
-    If `args.check` is enabled, bitwise accuracy is computed and displayed.
-    Additionally, optional grid visualizations for clean, fingerprinted, and
-    residual images are available for debugging, but commented out by default.
     """
-    all_fingerprinted_images = []
-    all_fingerprints = []
-
     print("Fingerprinting the images...")
     torch.manual_seed(args.seed)
 
-    fingerprints = generate_random_fingerprints(FINGERPRINT_SIZE, 1)
-    fingerprints = fingerprints.view(1, FINGERPRINT_SIZE).expand(BATCH_SIZE, FINGERPRINT_SIZE)
-    fingerprints = fingerprints.to(device)
-
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-    bitwise_accuracy = 0
-
-    for images, _ in tqdm(dataloader):
-        if not args.identical_fingerprints:
-            fingerprints = generate_random_fingerprints(FINGERPRINT_SIZE, BATCH_SIZE)
-            fingerprints = fingerprints.view(BATCH_SIZE, FINGERPRINT_SIZE)
-            fingerprints = fingerprints.to(device)
-
-        images = images.to(device)
-        fingerprinted_images = HideNet(fingerprints[: images.size(0)], images)
-        all_fingerprinted_images.append(fingerprinted_images.detach().cpu())
-        all_fingerprints.append(fingerprints[: images.size(0)].detach().cpu())
-
-        if args.check:
-            detected_fingerprints = RevealNet(fingerprinted_images)
-            detected_fingerprints = (detected_fingerprints > 0).long()
-            bitwise_accuracy += (
-                (detected_fingerprints[: images.size(0)].detach() == fingerprints[: images.size(0)])
-                .float()
-                .mean(dim=1)
-                .sum()
-                .item()
-            )
-
-    all_fingerprinted_images = torch.cat(all_fingerprinted_images, dim=0).cpu()
-    all_fingerprints = torch.cat(all_fingerprints, dim=0).cpu()
-
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.output_dir_note, exist_ok=True)
+    fingerprint_log = open(os.path.join(args.output_dir_note, "embedded_fingerprints.txt"), "w")
 
-    f = open(os.path.join(args.output_dir_note, "embedded_fingerprints.txt"), "w")
-    for idx in range(len(all_fingerprinted_images)):
-        image = all_fingerprinted_images[idx]
-        fingerprint = all_fingerprints[idx]
-        _, filename = os.path.split(dataset.filenames[idx])
-        filename = filename.split('.')[0] + ".png"
-        save_image(image, os.path.join(args.output_dir, f"{filename}"), padding=0)
-        fingerprint_str = "".join(map(str, fingerprint.cpu().long().numpy().tolist()))
-        f.write(f"{filename} {fingerprint_str}\n")
-    f.close()
+    bitwise_accuracy = 0
+    total_images = 0
 
-    if args.check:
-        bitwise_accuracy /= len(all_fingerprints)
-        print(f"Bitwise accuracy on fingerprinted images: {bitwise_accuracy}")
+    for batch_idx, (images, _) in enumerate(tqdm(dataloader)):
+        images = images.to(device)
+
+        if args.identical_fingerprints:
+            if batch_idx == 0:
+                fingerprints = generate_random_fingerprints(FINGERPRINT_SIZE, 1)
+                fingerprints = fingerprints.expand(images.size(0), -1)
+        else:
+            fingerprints = generate_random_fingerprints(FINGERPRINT_SIZE, images.size(0))
+
+        fingerprints = fingerprints.to(device)
+
+        fingerprinted_images = HideNet(fingerprints, images)
+
+        for i in range(images.size(0)):
+            global_idx = batch_idx * BATCH_SIZE + i
+            if global_idx >= len(dataset.filenames):
+                continue  # avoid overflow if dataset length not divisible by batch size
+
+            original_filename = os.path.basename(dataset.filenames[global_idx])
+            save_path = os.path.join(args.output_dir, original_filename)
+
+            save_image(fingerprinted_images[i].detach().cpu(), save_path, padding=0)
+
+            fingerprint_str = "".join(map(str, fingerprints[i].long().tolist()))
+            fingerprint_log.write(f"{original_filename} {fingerprint_str}\n")
+
+        if args.check:
+            detected = RevealNet(fingerprinted_images)
+            detected = (detected > 0).long()
+            bitwise_accuracy += (
+                (detected == fingerprints.long()).float().mean(dim=1).sum().item()
+            )
+            total_images += images.size(0)
+
+    fingerprint_log.close()
+
+    if args.check and total_images > 0:
+        accuracy = bitwise_accuracy / total_images
+        print(f"Bitwise accuracy on fingerprinted images: {accuracy:.4f}")
+
 
         # Optional debugging output: uncomment to generate visualization grids.
         # These show that the fingerprints are imperceptible to the human eye.
