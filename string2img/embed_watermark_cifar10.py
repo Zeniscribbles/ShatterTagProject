@@ -28,6 +28,13 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.utils import save_image
 
+# Device setup
+if int(args.cuda) == -1 or not torch.cuda.is_available():
+    device = torch.device("cpu")
+else:
+    device = torch.device(f"cuda:{args.cuda}")
+print(f"Using device: {device}")
+
 def generate_random_fingerprints(fingerprint_size, batch_size=4):
     z = torch.zeros((batch_size, fingerprint_size), dtype=torch.float).random_(0, 2)
     return z
@@ -35,8 +42,6 @@ def generate_random_fingerprints(fingerprint_size, batch_size=4):
 uniform_rv = torch.distributions.uniform.Uniform(
     torch.tensor([0.0]), torch.tensor([1.0])
 )
-
-device = torch.device("cpu") if int(args.cuda) == -1 else torch.device("cuda")
 
 class CustomImageFolder(Dataset):
     def __init__(self, data_dir, transform=None):
@@ -88,7 +93,7 @@ def load_models():
 
     from models import StegaStampEncoder, StegaStampDecoder
 
-    state_dict = torch.load(args.encoder_path)
+    state_dict = torch.load(args.encoder_path, map_location=device)
     FINGERPRINT_SIZE = state_dict["secret_dense.weight"].shape[-1]
 
     HideNet = StegaStampEncoder(
@@ -96,18 +101,15 @@ def load_models():
         IMAGE_CHANNELS,
         fingerprint_size=FINGERPRINT_SIZE,
         return_residual=False,
-    )
+    ).to(device)
+
     RevealNet = StegaStampDecoder(
         IMAGE_RESOLUTION, IMAGE_CHANNELS, fingerprint_size=FINGERPRINT_SIZE
-    )
+    ).to(device)
 
-    kwargs = {"map_location": "cpu"} if args.cuda == -1 else {}
     if args.check:
-        RevealNet.load_state_dict(torch.load(args.decoder_path), **kwargs)
-    HideNet.load_state_dict(torch.load(args.encoder_path, **kwargs))
-
-    HideNet = HideNet.to(device)
-    RevealNet = RevealNet.to(device)
+        RevealNet.load_state_dict(torch.load(args.decoder_path, map_location=device))
+    HideNet.load_state_dict(torch.load(args.encoder_path, map_location=device))
 
 def embed_fingerprints():
     all_fingerprinted_images = []
@@ -117,19 +119,17 @@ def embed_fingerprints():
     torch.manual_seed(args.seed)
 
     fingerprints = generate_random_fingerprints(FINGERPRINT_SIZE, 1)
-    fingerprints = fingerprints.view(1, FINGERPRINT_SIZE).expand(BATCH_SIZE, FINGERPRINT_SIZE)
-    fingerprints = fingerprints.to(device)
+    fingerprints = fingerprints.view(1, FINGERPRINT_SIZE).expand(BATCH_SIZE, FINGERPRINT_SIZE).to(device)
 
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
     bitwise_accuracy = 0
 
     for images, _ in tqdm(dataloader):
-        if not args.identical_fingerprints:
-            fingerprints = generate_random_fingerprints(FINGERPRINT_SIZE, BATCH_SIZE)
-            fingerprints = fingerprints.view(BATCH_SIZE, FINGERPRINT_SIZE)
-            fingerprints = fingerprints.to(device)
-
         images = images.to(device)
+
+        if not args.identical_fingerprints:
+            fingerprints = generate_random_fingerprints(FINGERPRINT_SIZE, BATCH_SIZE).to(device)
+
         fingerprinted_images = HideNet(fingerprints[: images.size(0)], images)
         all_fingerprinted_images.append(fingerprinted_images.detach().cpu())
         all_fingerprints.append(fingerprints[: images.size(0)].detach().cpu())
