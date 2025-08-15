@@ -274,7 +274,11 @@ def main(args):
                 writer.add_image("residual", make_grid(residual, normalize=True, scale_each=True), global_step)
                 writer.add_image("image_with_fingerprint", make_grid(fingerprinted_images, normalize=True), global_step)
 
-                save_image(fingerprinted_images, os.path.join(SAVED_IMAGES, f"{global_step}.png"), normalize=True)
+                # Save each fingerprinted image individually instead of as a grid
+                for i in range(fingerprinted_images.size(0)):
+                    save_path = os.path.join(SAVED_IMAGES, f"{global_step}_{i}.png")
+                    save_image(fingerprinted_images[i], save_path, normalize=True)
+
 
                 writer.add_scalar("loss_weights/l2_loss_weight", l2_loss_weight, global_step)
                 writer.add_scalar("loss_weights/BCE_loss_weight", BCE_loss_weight, global_step)
