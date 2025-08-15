@@ -129,7 +129,7 @@ def build_dataloader(data_dir: str, image_resolution: int, batch_size: int, devi
 
     # Preview image shape
     sample_image, _ = dataset[0]
-    print("📸 Sample image loaded size:", tuple(sample_image.shape))
+    print("Sample image loaded size:", tuple(sample_image.shape))
 
     return dataset, dataloader
 
