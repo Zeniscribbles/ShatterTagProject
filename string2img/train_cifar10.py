@@ -84,8 +84,9 @@ class CustomImageFolder(Dataset):
     """
     def __init__(self, data_dir, transform=None):
         self.transform = transform
+        patts = ["**/*.png", "**/*.jpg", "**/*.jpeg"]
         self.filenames = sorted(
-            glob.glob(os.path.join(data_dir, "**", "*.[pj][pn]g"), recursive=True)
+            sum((glob.glob(os.path.join(data_dir, p), recursive=True) for p in patts), [])
         )
         if not self.filenames:
             raise RuntimeError(f"No image files found in {data_dir}")
@@ -297,6 +298,13 @@ def main(args):
     print(f"Checkpoints saved to: {CHECKPOINTS_PATH}")
     print(f"Fingerprinted images saved to: {SAVED_IMAGES}")
     print(f"Logs available for TensorBoard in: {LOGS_PATH}")
+
+    # Always save a final checkpoint
+    torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_last.pth"))
+    torch.save(encoder.state_dict(),               join(CHECKPOINTS_PATH, EXP_NAME + "_encoder_last.pth"))
+    torch.save(decoder.state_dict(),               join(CHECKPOINTS_PATH, EXP_NAME + "_decoder_last.pth"))
+    with open(join(CHECKPOINTS_PATH, EXP_NAME + "_last_step.txt"), "w") as f:
+        f.write(str(global_step))
 
     writer.close()
 
