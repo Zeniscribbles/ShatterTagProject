@@ -1,36 +1,15 @@
+
 """
-train_cifar10.py
+train_cifar10.py (patched)
 
-Main training script for the StegaFrag watermarking framework.
+- Robust device parsing: accepts int, "cpu", "cuda", "cuda:N" and falls back gracefully.
+- Determinism switch via --seed (freezes CuDNN where appropriate).
+- Faster DataLoader defaults: num_workers/pin_memory chosen based on device; CLI override.
+- Automatic Mixed Precision (AMP) on CUDA for speed.
+- Clear run header and path validations.
+- Keeps your losses/scheduling, logging, and checkpointing semantics.
 
-This script trains a convolutional encoder-decoder pair to embed and recover binary fingerprints
-(aka watermarks) from RGB images. The system is designed to support both robust watermarking 
-(for ownership verification) and future extensions toward fragile watermarking 
-(for tamper detection and image integrity).
-
-Key Features:
--------------
-- Dataset-agnostic training (supports arbitrary image folders)
-- Configurable loss weights, logging intervals, and batch sizes via argparse
-- Modular encoder/decoder architecture (see models.py)
-- TensorBoard logging and periodic checkpointing
-- Compatible with Google Colab or local execution
-
-Typical Use Case:
------------------
-Use this script to train an encoder and decoder pair on your dataset.
-The encoder embeds binary fingerprints into images, while the decoder learns to recover them.
-
-Future Direction:
------------------
-This framework will be extended to support fragile watermarking where 
-minor image tampering breaks fingerprint recoverability — useful for tamper detection.
-
-Usage:
-------
-python train_cifar10.py --data_dir ./images --output_dir ./output --image_resolution 128 --bit_length 64
-
-Author: Amanda + Chansen
+Author: Amanda + Chansen (+ patch pass)
 """
 
 import argparse
@@ -38,7 +17,6 @@ import glob
 import os
 from os.path import join
 from datetime import datetime
-from time import time
 
 import PIL
 import torch
@@ -49,23 +27,55 @@ from torchvision import transforms
 from torchvision.utils import make_grid, save_image
 from torch.optim import Adam
 from tqdm import tqdm
+import random
+import numpy as np
 
 import models
 
 
-def generate_random_fingerprints(batch_size, bit_length):
+# -------------------- Utilities --------------------
+
+def parse_device(arg_cuda):
     """
-    Generate a binary fingerprint vector for each image in a batch.
-
-    Args:
-        batch_size (int): Number of samples in the batch.
-        bit_length (int): Number of bits per fingerprint.
-
-    Returns:
-        Tensor of shape (batch_size, bit_length) with binary values (0 or 1).
+    Accepts: int (0,1,...), 'cpu', 'cuda', or 'cuda:N'.
+    Falls back to best available device.
     """
-    return torch.randint(0, 2, (batch_size, bit_length), dtype=torch.float)
+    if isinstance(arg_cuda, int):
+        return torch.device(f"cuda:{arg_cuda}") if torch.cuda.is_available() else torch.device("cpu")
+    if isinstance(arg_cuda, str):
+        s = arg_cuda.strip().lower()
+        if s == "cpu":
+            return torch.device("cpu")
+        if s == "cuda":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if s.startswith("cuda:"):
+            try:
+                idx = int(s.split(":")[1])
+                return torch.device(f"cuda:{idx}") if torch.cuda.is_available() else torch.device("cpu")
+            except Exception:
+                pass
+        # plain int as string?
+        if s.isdigit():
+            idx = int(s)
+            return torch.device(f"cuda:{idx}") if torch.cuda.is_available() else torch.device("cpu")
+    # default
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def make_deterministic(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+# -------------------- Dataset --------------------
 
 class CustomImageFolder(Dataset):
     """
@@ -91,77 +101,92 @@ class CustomImageFolder(Dataset):
         return len(self.filenames)
 
 
-def load_data(args):
-    """
-    Load image dataset and return a PyTorch DataLoader.
-
-    Args:
-        args (Namespace): Parsed command-line arguments.
-
-    Returns:
-        tuple: (dataset, dataloader)
-    """
-    transform = transforms.Compose([
-        transforms.Resize((args.image_resolution, args.image_resolution)),
+def build_transforms(image_resolution: int):
+    return transforms.Compose([
+        transforms.Resize((image_resolution, image_resolution)),
         transforms.ToTensor(),
     ])
 
-    dataset = CustomImageFolder(args.data_dir, transform=transform)
+
+def build_dataloader(data_dir: str, image_resolution: int, batch_size: int, device: torch.device,
+                     num_workers: int = None):
+    transform = build_transforms(image_resolution)
+    dataset = CustomImageFolder(data_dir, transform=transform)
+
+    use_cuda = device.type == "cuda"
+    if num_workers is None:
+        # Good defaults for Colab/local
+        num_workers = 2 if use_cuda else 0
+
     dataloader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=2, # 2 workers for google colab
+        num_workers=num_workers,
         drop_last=True,
+        pin_memory=use_cuda,
     )
 
     # Preview image shape
     sample_image, _ = dataset[0]
-    print("📸 Sample image loaded size:", sample_image.shape)
+    print("📸 Sample image loaded size:", tuple(sample_image.shape))
 
     return dataset, dataloader
 
 
-def main(args):
-    """
-    Main training loop for StegaStamp encoder/decoder.
+# -------------------- Main training --------------------
 
-    Args:
-        args (Namespace): Parsed command-line arguments.
-    """
+def main(args):
+    # Validate paths
+    if not os.path.isdir(args.data_dir):
+        raise FileNotFoundError(f"--data_dir not found: {args.data_dir}")
+
+    # Device + determinism
+    device = parse_device(args.cuda)
+    use_cuda = device.type == "cuda"
+    if args.seed is not None:
+        make_deterministic(args.seed)
+
+    # Output structure
     LOGS_PATH = os.path.join(args.output_dir, "logs")
     CHECKPOINTS_PATH = os.path.join(args.output_dir, "checkpoints")
     SAVED_IMAGES = os.path.join(args.output_dir, "saved_images")
-
-    os.makedirs(LOGS_PATH, exist_ok=True)
-    os.makedirs(CHECKPOINTS_PATH, exist_ok=True)
-    os.makedirs(SAVED_IMAGES, exist_ok=True)
+    ensure_dir(LOGS_PATH); ensure_dir(CHECKPOINTS_PATH); ensure_dir(SAVED_IMAGES)
 
     writer = SummaryWriter(LOGS_PATH)
-
-    dt_string = datetime.now().strftime("%d%m%Y_%H:%M:%S")
+    dt_string = datetime.now().strftime("%Y%m%d_%H%M%S")
     EXP_NAME = f"stegastamp_{args.bit_length}_{dt_string}"
 
-    device = torch.device(args.cuda if torch.cuda.is_available() else "cpu")
-    dataset, dataloader = load_data(args)
+    # Data
+    dataset, dataloader = build_dataloader(
+        args.data_dir, args.image_resolution, args.batch_size, device, args.num_workers
+    )
     IMAGE_CHANNELS = 3
 
-    # Set up plot points for logging frequency
-    plot_points = list(range(0, args.num_epochs * 1000, args.log_interval))
+    # Clear run header
+    print("=" * 70)
+    print("ShatterTag CIFAR10 training")
+    print(f"device={device} (cuda_available={torch.cuda.is_available()})")
+    print(f"seed={args.seed}")
+    print(f"data_dir={args.data_dir}")
+    print(f"output_dir={args.output_dir}")
+    print(f"image_resolution={args.image_resolution}  batch_size={args.batch_size}  epochs={args.num_epochs}")
+    print(f"bit_length={args.bit_length}  lr={args.lr}")
+    print(f"losses: BCE={args.BCE_loss_weight}  L2={args.l2_loss_weight} "
+          f"(ramp={args.l2_loss_ramp}, await={args.l2_loss_await})")
+    print(f"num_workers={args.num_workers if args.num_workers is not None else ('auto(' + str(2 if use_cuda else 0) + ')')}  pin_memory={use_cuda}")
+    print("=" * 70)
 
+    # Models
     encoder = models.StegaStampEncoder(
-        args.image_resolution,
-        IMAGE_CHANNELS,
-        args.bit_length,
-        return_residual=False,
+        args.image_resolution, IMAGE_CHANNELS, args.bit_length, return_residual=False
     ).to(device)
-
     decoder = models.StegaStampDecoder(
-        args.image_resolution,
-        IMAGE_CHANNELS,
-        args.bit_length,
+        args.image_resolution, IMAGE_CHANNELS, args.bit_length
     ).to(device)
+    encoder.train(); decoder.train()
 
+    # Optimizer
     decoder_encoder_optim = Adam(
         params=list(decoder.parameters()) + list(encoder.parameters()), lr=args.lr
     )
@@ -169,22 +194,22 @@ def main(args):
     global_step = 0
     steps_since_l2_loss_activated = -1
 
+    scaler = torch.cuda.amp.GradScaler(enabled=use_cuda)
+
+    # Precompute logging steps
+    # If log_interval is in "steps", just use modulo. Keep your plot_points approach but safer.
+    next_log = args.log_interval
+
     for i_epoch in range(args.num_epochs):
         print(f"\n🌀 Epoch [{i_epoch + 1}/{args.num_epochs}]")
 
-        for images, _ in tqdm(dataloader, desc=f"Training Step (Epoch {i_epoch + 1})", leave=False):
+        for images, _ in tqdm(dataloader, desc=f"Training (Epoch {i_epoch + 1})", leave=False):
             global_step += 1
             batch_size = images.size(0)
 
-            fingerprints = generate_random_fingerprints(
-                batch_size,
-                args.bit_length
-            ).to(device)
-
-            # Debug fingerprint/image shape before encoder
-            print("\nDEBUG: Sending batch into encoder")
-            print(f"  ↳ fingerprints: {fingerprints.shape}")
-            print(f"  ↳ clean_images: {images.shape}")
+            fingerprints = torch.randint(
+                0, 2, (batch_size, args.bit_length), dtype=torch.float, device=device
+            )
 
             # Weight schedule for L2 loss
             l2_loss_weight = min(
@@ -192,33 +217,33 @@ def main(args):
                     0,
                     args.l2_loss_weight
                     * (steps_since_l2_loss_activated - args.l2_loss_await)
-                    / args.l2_loss_ramp,
+                    / max(1, args.l2_loss_ramp),
                 ),
                 args.l2_loss_weight,
             )
             BCE_loss_weight = args.BCE_loss_weight
 
-            clean_images = images.to(device)
-            fingerprinted_images = encoder(fingerprints, clean_images)
-            residual = fingerprinted_images - clean_images
+            clean_images = images.to(device, non_blocking=True)
 
-            decoder_output = decoder(fingerprinted_images)
+            with torch.cuda.amp.autocast(enabled=use_cuda):
+                fingerprinted_images = encoder(fingerprints, clean_images)
+                residual = fingerprinted_images - clean_images
 
-            # Compute loss
-            l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
-            BCE_loss = nn.BCEWithLogitsLoss()(decoder_output.view(-1), fingerprints.view(-1))
-            loss = l2_loss_weight * l2_loss + BCE_loss_weight * BCE_loss
+                decoder_output = decoder(fingerprinted_images)
 
-            encoder.zero_grad()
-            decoder.zero_grad()
-            loss.backward()
-            decoder_encoder_optim.step()
+                # Compute loss
+                l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
+                BCE_loss = nn.BCEWithLogitsLoss()(decoder_output.view(-1), fingerprints.view(-1))
+                loss = l2_loss_weight * l2_loss + BCE_loss_weight * BCE_loss
+
+            decoder_encoder_optim.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(decoder_encoder_optim)
+            scaler.update()
 
             # Accuracy
             fingerprints_predicted = (decoder_output > 0).float()
-            bitwise_accuracy = 1.0 - torch.mean(
-                torch.abs(fingerprints - fingerprints_predicted)
-            )
+            bitwise_accuracy = 1.0 - torch.mean(torch.abs(fingerprints - fingerprints_predicted))
 
             if steps_since_l2_loss_activated == -1 and bitwise_accuracy.item() > 0.9:
                 steps_since_l2_loss_activated = 0
@@ -226,22 +251,23 @@ def main(args):
                 steps_since_l2_loss_activated += 1
 
             # Logging
-            if global_step in plot_points:
-                writer.add_scalar("bitwise_accuracy", bitwise_accuracy, global_step)
-                writer.add_scalar("loss", loss, global_step)
-                writer.add_scalar("BCE_loss", BCE_loss, global_step)
+            if global_step >= next_log:
+                writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
+                writer.add_scalar("loss/total", loss.item(), global_step)
+                writer.add_scalar("loss/bce", BCE_loss.item(), global_step)
+                writer.add_scalar("loss/l2", l2_loss.item(), global_step)
                 writer.add_scalars("clean_statistics", {
-                    "min": clean_images.min(),
-                    "max": clean_images.max()
+                    "min": clean_images.min().item(),
+                    "max": clean_images.max().item()
                 }, global_step)
                 writer.add_scalars("with_fingerprint_statistics", {
-                    "min": fingerprinted_images.min(),
-                    "max": fingerprinted_images.max()
+                    "min": fingerprinted_images.min().item(),
+                    "max": fingerprinted_images.max().item()
                 }, global_step)
                 writer.add_scalars("residual_statistics", {
-                    "min": residual.min(),
-                    "max": residual.max(),
-                    "mean_abs": residual.abs().mean()
+                    "min": residual.min().item(),
+                    "max": residual.max().item(),
+                    "mean_abs": residual.abs().mean().item()
                 }, global_step)
 
                 writer.add_image("clean_image", make_grid(clean_images, normalize=True), global_step)
@@ -253,8 +279,10 @@ def main(args):
                 writer.add_scalar("loss_weights/l2_loss_weight", l2_loss_weight, global_step)
                 writer.add_scalar("loss_weights/BCE_loss_weight", BCE_loss_weight, global_step)
 
-            # Checkpoint
-            if global_step % 5000 == 0:
+                next_log += args.log_interval
+
+            # Periodic checkpoint
+            if global_step % args.ckpt_interval == 0:
                 torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_optim.pth"))
                 torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_encoder.pth"))
                 torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_decoder.pth"))
@@ -269,6 +297,8 @@ def main(args):
     writer.close()
 
 
+# -------------------- CLI --------------------
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train StegaStamp model for image watermarking.")
 
@@ -278,19 +308,18 @@ if __name__ == "__main__":
     parser.add_argument("--bit_length", type=int, default=64, help="Length of the binary fingerprint vector.")
     parser.add_argument("--batch_size", type=int, default=64, help="Training batch size.")
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs.")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
-    parser.add_argument("--cuda", type=str, default="cuda", help="Device to use (e.g., 'cuda' or 'cpu').")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default bumped to 1e-3 for speed).")
+    parser.add_argument("--cuda", type=str, default="cuda", help="Device to use: int index, 'cpu', 'cuda', or 'cuda:N'.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for determinism (set None to disable).")
 
     parser.add_argument("--l2_loss_weight", type=float, default=1.0, help="Max weight for image reconstruction loss (MSE).")
     parser.add_argument("--l2_loss_await", type=int, default=0, help="Step at which to begin applying L2 loss.")
     parser.add_argument("--l2_loss_ramp", type=int, default=1000, help="Steps to ramp up L2 loss to full strength.")
     parser.add_argument("--BCE_loss_weight", type=float, default=1.0, help="Weight for binary cross-entropy loss.")
 
-    parser.add_argument(
-        "--log_interval", type=int, default=1000,
-        help="Steps between logging diagnostics/images. Lower = more verbose."
-    )
+    parser.add_argument("--log_interval", type=int, default=1000, help="Steps between logging diagnostics/images.")
+    parser.add_argument("--ckpt_interval", type=int, default=5000, help="Steps between checkpoints.")
+    parser.add_argument("--num_workers", type=int, default=None, help="DataLoader workers (None = auto).")
 
     args = parser.parse_args()
     main(args)
-
