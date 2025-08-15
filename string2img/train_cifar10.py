@@ -1,4 +1,3 @@
-
 """
 train_cifar10.py (patched)
 
@@ -8,13 +7,15 @@ train_cifar10.py (patched)
 - Automatic Mixed Precision (AMP) on CUDA for speed.
 - Clear run header and path validations.
 - Keeps your losses/scheduling, logging, and checkpointing semantics.
+- Epoch snapshots + periodic audit evaluation.
 
-Author: Amanda + Chansen (+ patch pass)
+Author: Amanda + Chansen 
 """
 
 import argparse
 import glob
 import os
+from audit_hook import maybe_run_audit
 from os.path import join
 from datetime import datetime
 
@@ -151,8 +152,9 @@ def main(args):
     # Output structure
     LOGS_PATH = os.path.join(args.output_dir, "logs")
     CHECKPOINTS_PATH = os.path.join(args.output_dir, "checkpoints")
+    EPOCH_CKPTS = os.path.join(CHECKPOINTS_PATH, "epochs")
     SAVED_IMAGES = os.path.join(args.output_dir, "saved_images")
-    ensure_dir(LOGS_PATH); ensure_dir(CHECKPOINTS_PATH); ensure_dir(SAVED_IMAGES)
+    ensure_dir(LOGS_PATH); ensure_dir(CHECKPOINTS_PATH); ensure_dir(EPOCH_CKPTS); ensure_dir(SAVED_IMAGES)
 
     writer = SummaryWriter(LOGS_PATH)
     dt_string = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -198,7 +200,6 @@ def main(args):
     scaler = torch.cuda.amp.GradScaler(enabled=use_cuda)
 
     # Precompute logging steps
-    # If log_interval is in "steps", just use modulo. Keep your plot_points approach but safer.
     next_log = args.log_interval
 
     for i_epoch in range(args.num_epochs):
@@ -280,7 +281,6 @@ def main(args):
                     save_path = os.path.join(SAVED_IMAGES, f"{global_step}_{i}.png")
                     save_image(fingerprinted_images[i], save_path, normalize=True)
 
-
                 writer.add_scalar("loss_weights/l2_loss_weight", l2_loss_weight, global_step)
                 writer.add_scalar("loss_weights/BCE_loss_weight", BCE_loss_weight, global_step)
 
@@ -293,6 +293,40 @@ def main(args):
                 torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_decoder.pth"))
                 with open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w") as f:
                     f.write(str(global_step))
+
+        # ---- end-of-epoch snapshot + audit ----
+        epoch_tag = f"epoch_{i_epoch+1:03d}"
+
+        encoder_ckpt_path = os.path.join(EPOCH_CKPTS, f"{EXP_NAME}_{epoch_tag}_encoder.pth")
+        decoder_ckpt_path = os.path.join(EPOCH_CKPTS, f"{EXP_NAME}_{epoch_tag}_decoder.pth")
+        optim_ckpt_path   = os.path.join(EPOCH_CKPTS, f"{EXP_NAME}_{epoch_tag}_optim.pth")
+
+        # Save epoch snapshots (encoder/decoder mandatory; optimizer optional but handy)
+        torch.save(encoder.state_dict(), encoder_ckpt_path)
+        torch.save(decoder.state_dict(), decoder_ckpt_path)
+        torch.save(decoder_encoder_optim.state_dict(), optim_ckpt_path)
+
+        # Kick off an audit run, if enabled
+        maybe_run_audit(
+            epoch=i_epoch + 1,
+            every=args.audit_eval_every,
+            data_dir=(args.audit_data_dir or args.data_dir),
+            encoder_ckpt=encoder_ckpt_path,
+            decoder_ckpt=decoder_ckpt_path,
+            out_dir=os.path.join(args.output_dir, "audits", epoch_tag),
+            image_resolution=args.image_resolution,
+            bit_length=args.bit_length,
+            batch_size=args.audit_batch_size,
+            cuda=args.cuda,
+            seed=args.audit_seed,
+            limit_images=args.audit_limit_images,
+            save_images=args.audit_save_images,
+            save_npz=args.audit_save_npz,
+            tar_images=args.audit_tar_images,
+            threshold=args.audit_threshold,
+            eval_script_path=args.audit_script_path,
+        )
+        # ---- end-of-epoch snapshot + audit ----
 
     print(f"\nTraining complete. Final step: {global_step}")
     print(f"Checkpoints saved to: {CHECKPOINTS_PATH}")
@@ -332,6 +366,21 @@ if __name__ == "__main__":
     parser.add_argument("--log_interval", type=int, default=1000, help="Steps between logging diagnostics/images.")
     parser.add_argument("--ckpt_interval", type=int, default=5000, help="Steps between checkpoints.")
     parser.add_argument("--num_workers", type=int, default=None, help="DataLoader workers (None = auto).")
+
+    # Auditing and Eval:
+    parser.add_argument("--audit_eval_every", type=int, default=0,
+                        help="Run eval_exhaustive every N epochs (0=off).")
+    parser.add_argument("--audit_data_dir", type=str, default=None,
+                        help="Dataset for audits (defaults to --data_dir).")
+    parser.add_argument("--audit_batch_size", type=int, default=128)
+    parser.add_argument("--audit_seed", type=int, default=123)
+    parser.add_argument("--audit_limit_images", type=int, default=None)
+    parser.add_argument("--audit_save_images", choices=["none","failures","all"], default="failures")
+    parser.add_argument("--audit_save_npz", action="store_true")
+    parser.add_argument("--audit_tar_images", action="store_true")
+    parser.add_argument("--audit_threshold", type=float, default=0.99)
+    parser.add_argument("--audit_script_path", type=str, default="string2img/eval_exhaustive.py",
+                        help="Path to eval_exhaustive.py (relative to repo root)")
 
     args = parser.parse_args()
     main(args)
