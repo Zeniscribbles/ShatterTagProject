@@ -1,14 +1,45 @@
 """
-Detect Watermarks from Images Using a Pretrained StegaStamp Decoder.
+Detect watermarks from images using a pretrained StegaStamp decoder.
 
-This script loads a batch of fingerprinted images and attempts to decode
-the embedded fingerprint from each using a trained decoder model. Outputs
-bitwise accuracy and optionally prints or stores the detected fingerprints.
+This script loads a trained decoder and attempts to recover embedded
+bitstrings from a directory of images (typically those produced by an
+embedding step). It can optionally compute bitwise accuracy if a single
+ground-truth fingerprint is provided.
 
-Usage (Colab-friendly):
-    Modify the argparse default values or use CLI for terminal runs.
+Typical use
+-----------
+Run from a terminal or Colab:
 
-Author: Your Project Team
+    python detect_watermark_cifar10.py \
+        --decoder_path /path/to/checkpoints/*_decoder_last.pth \
+        --data_dir /path/to/images \
+        --output_dir ./detections \
+        --image_resolution 32 \
+        --batch_size 128 \
+        --cuda 0
+
+Inputs
+------
+- decoder checkpoint (.pth): produced by the training pipeline, matching the
+  model architecture and bit length used during training.
+- images: .png/.jpg/.jpeg files located directly under --data_dir
+  (non-recursive in this implementation).
+
+Outputs
+-------
+- detected_fingerprints.txt (under --output_dir): one line per image with
+  "filename <bitstring>".
+- If --ground_truth_fp is provided, the script prints overall bitwise accuracy.
+
+Notes
+-----
+- --image_resolution must match training (e.g., 32 for CIFAR-10).
+- This script uses a non-recursive file search; point --data_dir at the leaf
+  folder that actually contains the images.
+- CUDA device selection: pass --cuda -1 to force CPU, or an integer index
+  (0, 1, ...) to pick a GPU when available.
+
+Author: Amanda + Chansen
 """
 
 import argparse
