@@ -7,11 +7,11 @@ Keeps original logic:
 - optional on-the-fly check via decoder
 - same function structure: load_data -> load_models -> embed_fingerprints
 
-Colab hardening:
-- creates output dirs up front; streams saves (no giant RAM lists)
-- robust device parsing; eval()+inference_mode() to cut memory
-- safe encoder/decoder checkpoint resolution (supports glob patterns)
-- optional case-insensitive recursive loader (flag off by default)
+Colab hardening (only what this file actually does):
+- creates output dirs up front
+- robust device parsing (CPU / CUDA / CUDA:N); models set to eval()
+- RGB-safe image loading (PIL .convert('RGB'))
+- checkpoints loaded on CPU, then moved to the selected device
 
 Typical use
 -----------
@@ -201,7 +201,7 @@ def load_models():
 def embed_fingerprints():
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.output_dir_note, exist_ok=True)
-    
+
     all_fingerprinted_images = []
     all_fingerprints = []
 
