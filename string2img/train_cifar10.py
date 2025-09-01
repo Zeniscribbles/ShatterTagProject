@@ -284,7 +284,7 @@ def main():
 
     for i_epoch in range(args.num_epochs):
         dataloader = DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=True, num_workers=16
+            dataset, batch_size=args.batch_size, shuffle=True, num_workers=2
         )
         for images, _ in tqdm(dataloader):
             global_step += 1
