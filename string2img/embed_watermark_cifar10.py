@@ -263,6 +263,7 @@ def embed_fingerprints():
         bitwise_accuracy = bitwise_accuracy / len(all_fingerprints)
         print(f"Bitwise accuracy on fingerprinted images: {bitwise_accuracy}")
 
+        # Add print statements to print this out
         save_image(images[:49], os.path.join(args.output_dir, "test_samples_clean.png"), nrow=7)
         save_image(fingerprinted_images[:49], os.path.join(args.output_dir, "test_samples_fingerprinted.png"), nrow=7)
         save_image(torch.abs(images - fingerprinted_images)[:49], os.path.join(args.output_dir, "test_samples_residual.png"), normalize=True, nrow=7)
