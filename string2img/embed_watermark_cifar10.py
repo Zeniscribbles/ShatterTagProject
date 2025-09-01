@@ -27,6 +27,7 @@ python embed_watermark_cifar10.py \
   --check --decoder_path "/path/to/*_decoder_last.pth"
 
 Author: Amanda + Chansen
+Citation:
 """
 
 import argparse
@@ -270,6 +271,10 @@ def embed_fingerprints():
 # Entry
 # -----------------------------
 def main():
+    
+    device = parse_device(args.cuda)
+    print(f"Using device: {device}")
+
     # Single-pass mode (Colab): honor CLI args and bail out
     if args.data_dir and args.output_dir and args.output_dir_note and args.encoder_path and args.image_resolution:
         # optional preflight (helpful, not required)

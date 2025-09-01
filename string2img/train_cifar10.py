@@ -1,100 +1,214 @@
 """
-train_cifar10.py (patched)
+train_cifar10.py — StegaStamp training
 
-- Robust device parsing: accepts int, "cpu", "cuda", "cuda:N" and falls back gracefully.
-- Determinism switch via --seed (freezes CuDNN where appropriate).
-- Faster DataLoader defaults: num_workers/pin_memory chosen based on device; CLI override.
-- Automatic Mixed Precision (AMP) on CUDA for speed.
-- Clear run header and path validations.
-- Keeps your losses/scheduling, logging, and checkpointing semantics.
-- Epoch snapshots + periodic audit evaluation.
+Overview
+--------
+Trains a StegaStamp-style encoder/decoder to embed and recover binary fingerprints from RGB images.
+This version stays faithful to the original training flow (same losses, scheduling, logging,
+and checkpointing). The only change is how the dataset is loaded so it works cleanly with
+a Google Colab–exported CIFAR-10 folder.
 
-Author: Amanda + Chansen 
+What changed for Colab CIFAR-10 import
+--------------------------------------
+- Flat-folder loader: instead of class subdirs or shard loops, the script reads a single
+  flat directory of images produced by your Colab export:
+    /.../data/cifar10/00000.png … 49999.png
+- No recursion, no labels required; we just glob .png/.jpg/.jpeg in that folder.
+- Everything else (model defs, optimizer, losses, bitwise accuracy metric, TensorBoard
+  logging, and checkpoint cadence) is unchanged.
+
+Typical use
+-----------
+python train_cifar10.py \
+  --data_dir "/content/drive/MyDrive/ShatterTagProject/data/cifar10" \
+  --output_dir "/content/drive/MyDrive/ShatterTagProject/output/cifar10_run1" \
+  --image_resolution 32 \
+  --bit_length 64 \
+  --batch_size 64 \
+  --num_epochs 10 \
+  --lr 1e-4 \
+  --cuda cuda \
+  --l2_loss_weight 1.0 \
+  --l2_loss_await 0 \
+  --l2_loss_ramp 1000 \
+  --BCE_loss_weight 1.0 
+
+Inputs
+------
+--data_dir: path to the flat CIFAR-10 export folder (images only, no subfolders)
+--output_dir: base directory for logs / checkpoints / saved images
+--image_resolution: square size to which images are resized/cropped
+--bit_length: number of bits in the embedded fingerprint
+(plus the usual optimizer, loss-weight, and logging args)
+
+Outputs
+-------
+- TensorBoard logs: <output_dir>/logs
+- Checkpoints:      <output_dir>/checkpoints
+- Sample images:    <output_dir>/saved_images
+
+Assumptions
+-----------
+- The Colab export produced RGB images with lowercase extensions (.png/.jpg/.jpeg).
+- The folder is flat (no class subdirectories).
+- image_resolution matches the training/eval pipeline (e.g., 32 for CIFAR-10).
+
+Author: Amanda + Chansen
+Citation: 
 """
 
 import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--data_dir", type=str, required=True, help="Directory with image dataset."
+)
+parser.add_argument(
+    "--use_celeba_preprocessing",
+    action="store_true",
+    help="Use CelebA specific preprocessing when loading the images.",
+)
+parser.add_argument(
+    "--output_dir", type=str, required=True, help="Directory to save results to."
+)
+parser.add_argument(
+    "--bit_length",
+    type=int,
+    default=64,
+    # required=True, // Must be supplied in CLI. Interferes with default.
+    help="Number of bits in the fingerprint.",
+)
+parser.add_argument(
+    "--image_resolution",
+    type=int,
+    default=32,
+    # required=True, // Must be supplied in CLI. Interferes with default.
+    help="Height and width of square images.",
+)
+parser.add_argument(
+    "--num_epochs", type=int, default=20, help="Number of training epochs."
+)
+parser.add_argument("--batch_size", type=int, default=64, help="Batch size.")
+parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate.")
+parser.add_argument("--cuda", type=str, default="cuda")
+
+parser.add_argument(
+    "--l2_loss_await",
+    help="Train without L2 loss for the first x iterations",
+    type=int,
+    default=1000,
+)
+parser.add_argument(
+    "--l2_loss_weight",
+    type=float,
+    default=10,
+    help="L2 loss weight for image fidelity.",
+)
+parser.add_argument(
+    "--l2_loss_ramp",
+    type=int,
+    default=3000,
+    help="Linearly increase L2 loss weight over x iterations.",
+)
+
+parser.add_argument(
+    "--BCE_loss_weight",
+    type=float,
+    default=1,
+    help="BCE loss weight for fingerprint reconstruction.",
+)
+
+args = parser.parse_args()
+
+
 import glob
 import os
-from audit_hook import maybe_run_audit
 from os.path import join
+from time import time
+
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda)
 from datetime import datetime
 
+from tqdm import tqdm
 import PIL
+
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
-from torchvision.utils import make_grid, save_image
+from torchvision.utils import make_grid
+# from torchvision.datasets import ImageFolder
+from torchvision.utils import save_image
+#from tensorboardX import SummaryWriter // Or import in google colab
+from torch.utils.tensorboard import SummaryWriter # For google colab
+
+
 from torch.optim import Adam
-from tqdm import tqdm
-import random
-import numpy as np
 
 import models
 
 
-# -------------------- Utilities --------------------
+LOGS_PATH = os.path.join(args.output_dir, "logs")
+CHECKPOINTS_PATH = os.path.join(args.output_dir, "checkpoints")
+SAVED_IMAGES = os.path.join(args.output_dir, "./saved_images")
 
-def parse_device(arg_cuda):
-    """
-    Accepts: int (0,1,...), 'cpu', 'cuda', or 'cuda:N'.
-    Falls back to best available device.
-    """
-    if isinstance(arg_cuda, int):
-        return torch.device(f"cuda:{arg_cuda}") if torch.cuda.is_available() else torch.device("cpu")
-    if isinstance(arg_cuda, str):
-        s = arg_cuda.strip().lower()
-        if s == "cpu":
-            return torch.device("cpu")
-        if s == "cuda":
-            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if s.startswith("cuda:"):
-            try:
-                idx = int(s.split(":")[1])
-                return torch.device(f"cuda:{idx}") if torch.cuda.is_available() else torch.device("cpu")
-            except Exception:
-                pass
-        # plain int as string?
-        if s.isdigit():
-            idx = int(s)
-            return torch.device(f"cuda:{idx}") if torch.cuda.is_available() else torch.device("cpu")
-    # default
+writer = SummaryWriter(LOGS_PATH)
+
+if not os.path.exists(LOGS_PATH):
+    os.makedirs(LOGS_PATH)
+if not os.path.exists(CHECKPOINTS_PATH):
+    os.makedirs(CHECKPOINTS_PATH)
+if not os.path.exists(SAVED_IMAGES):
+    os.makedirs(SAVED_IMAGES)
+
+
+def generate_random_fingerprints(bit_length, batch_size=4, size=(400, 400)):
+    z = torch.zeros((batch_size, bit_length), dtype=torch.float).random_(0, 2)
+    return z
+
+
+plot_points = (
+    list(range(0, 1000, 100))
+    + list(range(1000, 3000, 200))
+    + list(range(3000, 100000, 1000))
+)
+
+# -----------------------------
+# Device
+# -----------------------------
+def parse_device(spec: str) -> torch.device:
+    s = str(spec).strip().lower()
+    if s in ("-1", "cpu"):
+        return torch.device("cpu")
+    if s == "cuda":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if s.isdigit() and torch.cuda.is_available():
+        return torch.device(f"cuda:{int(s)}")
+    if s.startswith("cuda:") and torch.cuda.is_available():
+        return torch.device(s)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def make_deterministic(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
-
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
-# -------------------- Dataset --------------------
-
+# -------------------- NEW: flat-folder dataset for Colab export --------------------
+# CHANGE: replace the original dataset/sharded loader with a simple flat-folder loader.
 class CustomImageFolder(Dataset):
     """
-    Dataset that loads all .png, .jpg, and .jpeg images from a directory recursively.
-    Applies specified torchvision transforms.
+    Minimal change: read a flat folder of images produced by the Colab CIFAR-10 export.
+    (e.g., /.../cifar10/00000.png ... 49999.png; no class subdirs)
     """
     def __init__(self, data_dir, transform=None):
+        self.data_dir = data_dir
+        # CHANGE: load all images directly from a single directory (no recursion / no shards)
+        self.filenames = glob.glob(os.path.join(data_dir, "*.png"))
+        self.filenames.extend(glob.glob(os.path.join(data_dir, "*.jpeg")))
+        self.filenames.extend(glob.glob(os.path.join(data_dir, "*.jpg")))
+        self.filenames = sorted(self.filenames)
         self.transform = transform
-        patts = ["**/*.png", "**/*.jpg", "**/*.jpeg"]
-        self.filenames = sorted(
-            sum((glob.glob(os.path.join(data_dir, p), recursive=True) for p in patts), [])
-        )
-        if not self.filenames:
-            raise RuntimeError(f"No image files found in {data_dir}")
 
     def __getitem__(self, idx):
         filename = self.filenames[idx]
-        image = PIL.Image.open(filename).convert("RGB")
+        image = PIL.Image.open(filename).convert("RGB") # Converts anything to 3-channel 8-bit RGB:
         if self.transform:
             image = self.transform(image)
         return image, 0
@@ -103,93 +217,64 @@ class CustomImageFolder(Dataset):
         return len(self.filenames)
 
 
-def build_transforms(image_resolution: int):
-    return transforms.Compose([
-        transforms.Resize((image_resolution, image_resolution)),
-        transforms.ToTensor(),
-    ])
+def load_data():
+    global dataset, dataloader
+    global IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH, SECRET_SIZE
 
-
-def build_dataloader(data_dir: str, image_resolution: int, batch_size: int, device: torch.device,
-                     num_workers: int = None):
-    transform = build_transforms(image_resolution)
-    dataset = CustomImageFolder(data_dir, transform=transform)
-
-    use_cuda = device.type == "cuda"
-    if num_workers is None:
-        # Good defaults for Colab/local
-        num_workers = 2 if use_cuda else 0
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        drop_last=True,
-        pin_memory=use_cuda,
-    )
-
-    # Preview image shape
-    sample_image, _ = dataset[0]
-    print("Sample image loaded size:", tuple(sample_image.shape))
-
-    return dataset, dataloader
-
-
-# -------------------- Main training --------------------
-
-def main(args):
-    # Validate paths
-    if not os.path.isdir(args.data_dir):
-        raise FileNotFoundError(f"--data_dir not found: {args.data_dir}")
-
-    # Device + determinism
-    device = parse_device(args.cuda)
-    use_cuda = device.type == "cuda"
-    if args.seed is not None:
-        make_deterministic(args.seed)
-
-    # Output structure
-    LOGS_PATH = os.path.join(args.output_dir, "logs")
-    CHECKPOINTS_PATH = os.path.join(args.output_dir, "checkpoints")
-    EPOCH_CKPTS = os.path.join(CHECKPOINTS_PATH, "epochs")
-    SAVED_IMAGES = os.path.join(args.output_dir, "saved_images")
-    ensure_dir(LOGS_PATH); ensure_dir(CHECKPOINTS_PATH); ensure_dir(EPOCH_CKPTS); ensure_dir(SAVED_IMAGES)
-
-    writer = SummaryWriter(LOGS_PATH)
-    dt_string = datetime.now().strftime("%Y%m%d_%H%M%S")
-    EXP_NAME = f"stegastamp_{args.bit_length}_{dt_string}"
-
-    # Data
-    dataset, dataloader = build_dataloader(
-        args.data_dir, args.image_resolution, args.batch_size, device, args.num_workers
-    )
+    IMAGE_RESOLUTION = args.image_resolution
     IMAGE_CHANNELS = 3
 
-    # Clear run header
-    print("=" * 70)
-    print("ShatterTag CIFAR10 training")
-    print(f"device={device} (cuda_available={torch.cuda.is_available()})")
-    print(f"seed={args.seed}")
-    print(f"data_dir={args.data_dir}")
-    print(f"output_dir={args.output_dir}")
-    print(f"image_resolution={args.image_resolution}  batch_size={args.batch_size}  epochs={args.num_epochs}")
-    print(f"bit_length={args.bit_length}  lr={args.lr}")
-    print(f"losses: BCE={args.BCE_loss_weight}  L2={args.l2_loss_weight} "
-          f"(ramp={args.l2_loss_ramp}, await={args.l2_loss_await})")
-    print(f"num_workers={args.num_workers if args.num_workers is not None else ('auto(' + str(2 if use_cuda else 0) + ')')}  pin_memory={use_cuda}")
-    print("=" * 70)
+    SECRET_SIZE = args.bit_length
 
-    # Models
+    if args.use_celeba_preprocessing:
+        assert args.image_resolution == 128, f"CelebA preprocessing requires image resolution 128, got {args.image_resolution}."
+        transform = transforms.Compose(
+            [
+                transforms.CenterCrop(148),
+                transforms.Resize(128),
+                transforms.ToTensor(),
+            ]
+        )
+    else:
+
+        transform = transforms.Compose(
+            [
+                transforms.Resize(IMAGE_RESOLUTION),
+                transforms.CenterCrop(IMAGE_RESOLUTION),
+                transforms.ToTensor(),
+            ]
+        )
+
+    s = time()
+    print(f"Loading image folder {args.data_dir} ...")
+    # CHANGE: use the flat-folder loader instead of the original (which expected shards/class dirs)
+    dataset = CustomImageFolder(args.data_dir, transform=transform)
+    print(f"Finished. Loading took {time() - s:.2f}s")
+
+
+def main():
+    now = datetime.now()
+    dt_string = now.strftime("%d%m%Y_%H:%M:%S")
+    EXP_NAME = f"stegastamp_{args.bit_length}_{dt_string}"
+
+    device = parse_device(args.cuda)
+    print(f"Using device: {device}")
+
+    load_data()
     encoder = models.StegaStampEncoder(
-        args.image_resolution, IMAGE_CHANNELS, args.bit_length, return_residual=False
-    ).to(device)
+        args.image_resolution,
+        IMAGE_CHANNELS,
+        args.bit_length,
+        return_residual=False,
+    )
     decoder = models.StegaStampDecoder(
-        args.image_resolution, IMAGE_CHANNELS, args.bit_length
-    ).to(device)
-    encoder.train(); decoder.train()
+        args.image_resolution,
+        IMAGE_CHANNELS,
+        args.bit_length,
+    )
+    encoder = encoder.to(device)
+    decoder = decoder.to(device)
 
-    # Optimizer
     decoder_encoder_optim = Adam(
         params=list(decoder.parameters()) + list(encoder.parameters()), lr=args.lr
     )
@@ -197,190 +282,153 @@ def main(args):
     global_step = 0
     steps_since_l2_loss_activated = -1
 
-    scaler = torch.cuda.amp.GradScaler(enabled=use_cuda)
-
-    # Precompute logging steps
-    next_log = args.log_interval
-
     for i_epoch in range(args.num_epochs):
-        print(f"\n🌀 Epoch [{i_epoch + 1}/{args.num_epochs}]")
-
-        for images, _ in tqdm(dataloader, desc=f"Training (Epoch {i_epoch + 1})", leave=False):
+        dataloader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=True, num_workers=16
+        )
+        for images, _ in tqdm(dataloader):
             global_step += 1
-            batch_size = images.size(0)
 
-            fingerprints = torch.randint(
-                0, 2, (batch_size, args.bit_length), dtype=torch.float, device=device
+            batch_size = min(args.batch_size, images.size(0))
+            fingerprints = generate_random_fingerprints(
+                args.bit_length, batch_size, (args.image_resolution, args.image_resolution)
             )
 
-            # Weight schedule for L2 loss
             l2_loss_weight = min(
                 max(
                     0,
                     args.l2_loss_weight
                     * (steps_since_l2_loss_activated - args.l2_loss_await)
-                    / max(1, args.l2_loss_ramp),
+                    / args.l2_loss_ramp,
                 ),
                 args.l2_loss_weight,
             )
             BCE_loss_weight = args.BCE_loss_weight
 
-            clean_images = images.to(device, non_blocking=True)
+            clean_images = images.to(device)
+            fingerprints = fingerprints.to(device)
 
-            with torch.cuda.amp.autocast(enabled=use_cuda):
-                fingerprinted_images = encoder(fingerprints, clean_images)
-                residual = fingerprinted_images - clean_images
+            fingerprinted_images = encoder(fingerprints, clean_images)
+            residual = fingerprinted_images - clean_images
 
-                decoder_output = decoder(fingerprinted_images)
+            decoder_output = decoder(fingerprinted_images)
 
-                # Compute loss
-                l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
-                BCE_loss = nn.BCEWithLogitsLoss()(decoder_output.view(-1), fingerprints.view(-1))
-                loss = l2_loss_weight * l2_loss + BCE_loss_weight * BCE_loss
+            criterion = nn.MSELoss()
+            l2_loss = criterion(fingerprinted_images, clean_images)
 
-            decoder_encoder_optim.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(decoder_encoder_optim)
-            scaler.update()
+            criterion = nn.BCEWithLogitsLoss()
+            BCE_loss = criterion(decoder_output.view(-1), fingerprints.view(-1))
 
-            # Accuracy
+            loss = l2_loss_weight * l2_loss + BCE_loss_weight * BCE_loss
+
+            encoder.zero_grad()
+            decoder.zero_grad()
+
+            loss.backward()
+            decoder_encoder_optim.step()
+
             fingerprints_predicted = (decoder_output > 0).float()
-            bitwise_accuracy = 1.0 - torch.mean(torch.abs(fingerprints - fingerprints_predicted))
-
-            if steps_since_l2_loss_activated == -1 and bitwise_accuracy.item() > 0.9:
-                steps_since_l2_loss_activated = 0
-            elif steps_since_l2_loss_activated != -1:
+            bitwise_accuracy = 1.0 - torch.mean(
+                torch.abs(fingerprints - fingerprints_predicted)
+            )
+            if steps_since_l2_loss_activated == -1:
+                if bitwise_accuracy.item() > 0.9:
+                    steps_since_l2_loss_activated = 0
+            else:
                 steps_since_l2_loss_activated += 1
 
             # Logging
-            if global_step >= next_log:
-                writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
-                writer.add_scalar("loss/total", loss.item(), global_step)
-                writer.add_scalar("loss/bce", BCE_loss.item(), global_step)
-                writer.add_scalar("loss/l2", l2_loss.item(), global_step)
-                writer.add_scalars("clean_statistics", {
-                    "min": clean_images.min().item(),
-                    "max": clean_images.max().item()
-                }, global_step)
-                writer.add_scalars("with_fingerprint_statistics", {
-                    "min": fingerprinted_images.min().item(),
-                    "max": fingerprinted_images.max().item()
-                }, global_step)
-                writer.add_scalars("residual_statistics", {
-                    "min": residual.min().item(),
-                    "max": residual.max().item(),
-                    "mean_abs": residual.abs().mean().item()
-                }, global_step)
+            if global_step in plot_points:
+                # writer.add_scalar("bitwise_accuracy", bitwise_accuracy, global_step)
+                writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step) # For TensorBoard
+                print("Bitwise accuracy {}".format(bitwise_accuracy))
 
-                writer.add_image("clean_image", make_grid(clean_images, normalize=True), global_step)
-                writer.add_image("residual", make_grid(residual, normalize=True, scale_each=True), global_step)
-                writer.add_image("image_with_fingerprint", make_grid(fingerprinted_images, normalize=True), global_step)
+                # writer.add_scalar("loss", loss, global_step) # For TensorBoard
+                writer.add_scalar("loss", loss.item(), global_step)
 
-                # Save each fingerprinted image individually instead of as a grid
-                for i in range(fingerprinted_images.size(0)):
-                    save_path = os.path.join(SAVED_IMAGES, f"{global_step}_{i}.png")
-                    save_image(fingerprinted_images[i], save_path, normalize=True)
+                # writer.add_scalar("BCE_loss", BCE_loss, global_step) # For TensorBoard
+                writer.add_scalar("BCE_loss", BCE_loss.item(), global_step)
+                writer.add_scalars(
+                    "clean_statistics",
+                    {"min": clean_images.min(), "max": clean_images.max()},
+                    global_step,
+                ),
+                writer.add_scalars(
+                    "with_fingerprint_statistics",
+                    {
+                        "min": fingerprinted_images.min(),
+                        "max": fingerprinted_images.max(),
+                    },
+                    global_step,
+                ),
+                writer.add_scalars(
+                    "residual_statistics",
+                    {
+                        "min": residual.min(),
+                        "max": residual.max(),
+                        "mean_abs": residual.abs().mean(),
+                    },
+                    global_step,
+                ),
+                print(
+                    "residual_statistics: {}".format(
+                        {
+                            "min": residual.min(),
+                            "max": residual.max(),
+                            "mean_abs": residual.abs().mean(),
+                        }
+                    )
+                )
+                writer.add_image(
+                    "clean_image", make_grid(clean_images, normalize=True), global_step
+                )
+                writer.add_image(
+                    "residual",
+                    make_grid(residual, normalize=True, scale_each=True),
+                    global_step,
+                )
+                writer.add_image(
+                    "image_with_fingerprint",
+                    make_grid(fingerprinted_images, normalize=True),
+                    global_step,
+                )
+                save_image(
+                    fingerprinted_images,
+                    SAVED_IMAGES + "/{}.png".format(global_step),
+                    normalize=True,
+                )
 
-                writer.add_scalar("loss_weights/l2_loss_weight", l2_loss_weight, global_step)
-                writer.add_scalar("loss_weights/BCE_loss_weight", BCE_loss_weight, global_step)
+                writer.add_scalar(
+                    "loss_weights/l2_loss_weight", l2_loss_weight, global_step
+                )
+                writer.add_scalar(
+                    "loss_weights/BCE_loss_weight",
+                    BCE_loss_weight,
+                    global_step,
+                )
 
-                next_log += args.log_interval
+            # checkpointing
+            if global_step % 5000 == 0:
+                torch.save(
+                    decoder_encoder_optim.state_dict(),
+                    join(CHECKPOINTS_PATH, EXP_NAME + "_optim.pth"),
+                )
+                torch.save(
+                    encoder.state_dict(),
+                    join(CHECKPOINTS_PATH, EXP_NAME + "_encoder.pth"),
+                )
+                torch.save(
+                    decoder.state_dict(),
+                    join(CHECKPOINTS_PATH, EXP_NAME + "_decoder.pth"),
+                )
+                
+                f = open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w")
+                f.write(str(global_step))
+                f.close()
 
-            # Periodic checkpoint
-            if global_step % args.ckpt_interval == 0:
-                torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_optim.pth"))
-                torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_encoder.pth"))
-                torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_decoder.pth"))
-                with open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w") as f:
-                    f.write(str(global_step))
-
-        # ---- end-of-epoch snapshot + audit ----
-        epoch_tag = f"epoch_{i_epoch+1:03d}"
-
-        encoder_ckpt_path = os.path.join(EPOCH_CKPTS, f"{EXP_NAME}_{epoch_tag}_encoder.pth")
-        decoder_ckpt_path = os.path.join(EPOCH_CKPTS, f"{EXP_NAME}_{epoch_tag}_decoder.pth")
-        optim_ckpt_path   = os.path.join(EPOCH_CKPTS, f"{EXP_NAME}_{epoch_tag}_optim.pth")
-
-        # Save epoch snapshots (encoder/decoder mandatory; optimizer optional but handy)
-        torch.save(encoder.state_dict(), encoder_ckpt_path)
-        torch.save(decoder.state_dict(), decoder_ckpt_path)
-        torch.save(decoder_encoder_optim.state_dict(), optim_ckpt_path)
-
-        # Kick off an audit run, if enabled
-        maybe_run_audit(
-            epoch=i_epoch + 1,
-            every=args.audit_eval_every,
-            data_dir=(args.audit_data_dir or args.data_dir),
-            encoder_ckpt=encoder_ckpt_path,
-            decoder_ckpt=decoder_ckpt_path,
-            out_dir=os.path.join(args.output_dir, "audits", epoch_tag),
-            image_resolution=args.image_resolution,
-            bit_length=args.bit_length,
-            batch_size=args.audit_batch_size,
-            cuda=args.cuda,
-            seed=args.audit_seed,
-            limit_images=args.audit_limit_images,
-            save_images=args.audit_save_images,
-            save_npz=args.audit_save_npz,
-            tar_images=args.audit_tar_images,
-            threshold=args.audit_threshold,
-            eval_script_path=args.audit_script_path,
-        )
-        # ---- end-of-epoch snapshot + audit ----
-
-    print(f"\nTraining complete. Final step: {global_step}")
-    print(f"Checkpoints saved to: {CHECKPOINTS_PATH}")
-    print(f"Fingerprinted images saved to: {SAVED_IMAGES}")
-    print(f"Logs available for TensorBoard in: {LOGS_PATH}")
-
-    # Always save a final checkpoint
-    torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_last.pth"))
-    torch.save(encoder.state_dict(),               join(CHECKPOINTS_PATH, EXP_NAME + "_encoder_last.pth"))
-    torch.save(decoder.state_dict(),               join(CHECKPOINTS_PATH, EXP_NAME + "_decoder_last.pth"))
-    with open(join(CHECKPOINTS_PATH, EXP_NAME + "_last_step.txt"), "w") as f:
-        f.write(str(global_step))
-
+    # writer.export_scalars_to_json("./all_scalars.json")
     writer.close()
 
 
-# -------------------- CLI --------------------
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train StegaStamp model for image watermarking.")
-
-    parser.add_argument("--data_dir", type=str, required=True, help="Path to image dataset.")
-    parser.add_argument("--image_resolution", type=int, default=32, help="Input image resolution (e.g., 32 for CIFAR).")
-    parser.add_argument("--output_dir", type=str, default="./output", help="Directory for logs/checkpoints/images.")
-    parser.add_argument("--bit_length", type=int, default=64, help="Length of the binary fingerprint vector.")
-    parser.add_argument("--batch_size", type=int, default=64, help="Training batch size.")
-    parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default bumped to 1e-3 for speed).")
-    parser.add_argument("--cuda", type=str, default="cuda", help="Device to use: int index, 'cpu', 'cuda', or 'cuda:N'.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for determinism (set None to disable).")
-
-    parser.add_argument("--l2_loss_weight", type=float, default=1.0, help="Max weight for image reconstruction loss (MSE).")
-    parser.add_argument("--l2_loss_await", type=int, default=0, help="Step at which to begin applying L2 loss.")
-    parser.add_argument("--l2_loss_ramp", type=int, default=1000, help="Steps to ramp up L2 loss to full strength.")
-    parser.add_argument("--BCE_loss_weight", type=float, default=1.0, help="Weight for binary cross-entropy loss.")
-
-    parser.add_argument("--log_interval", type=int, default=1000, help="Steps between logging diagnostics/images.")
-    parser.add_argument("--ckpt_interval", type=int, default=5000, help="Steps between checkpoints.")
-    parser.add_argument("--num_workers", type=int, default=None, help="DataLoader workers (None = auto).")
-
-    # Auditing and Eval:
-    parser.add_argument("--audit_eval_every", type=int, default=0,
-                        help="Run eval_exhaustive every N epochs (0=off).")
-    parser.add_argument("--audit_data_dir", type=str, default=None,
-                        help="Dataset for audits (defaults to --data_dir).")
-    parser.add_argument("--audit_batch_size", type=int, default=128)
-    parser.add_argument("--audit_seed", type=int, default=123)
-    parser.add_argument("--audit_limit_images", type=int, default=None)
-    parser.add_argument("--audit_save_images", choices=["none","failures","all"], default="failures")
-    parser.add_argument("--audit_save_npz", action="store_true")
-    parser.add_argument("--audit_tar_images", action="store_true")
-    parser.add_argument("--audit_threshold", type=float, default=0.99)
-    parser.add_argument("--audit_script_path", type=str, default="string2img/eval_exhaustive.py",
-                        help="Path to eval_exhaustive.py (relative to repo root)")
-
-    args = parser.parse_args()
-    main(args)
+    main()
