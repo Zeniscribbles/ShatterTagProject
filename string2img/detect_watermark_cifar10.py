@@ -6,6 +6,16 @@ Minimal changes from original:
 - Optional --ground_truth_fp for fixed-bitstring evaluation (Method A).
 - Match train/embed preprocessing (Resize -> CenterCrop -> ToTensor).
 
+Usage:
+python detect_watermark_cifar10.py \
+  --data_dir "/content/drive/MyDrive/ShatterTagProject/output/cifar10_run1/embedded" \
+  --image_resolution 32 \
+  --decoder_path "/content/drive/.../checkpoints/*_decoder_last.pth" \
+  --batch_size 64 \
+  --cuda 0 \
+  --ground_truth_fp "0110...<64 bits>..." \
+  --output_dir "/content/drive/.../output/cifar10_run1/detect"
+
 Author: Amanda + Chansen
 Citation: https://github.com/yunqing-me/WatermarkDM.git
 """
