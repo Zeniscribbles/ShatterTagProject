@@ -94,18 +94,11 @@ def load_decoder():
 def load_data():
     global dataset, dataloader
 
-#    transform = transforms.Compose(
-#        [
-#           transforms.ToTensor(),
-#        ]
-#    )
-
-    # Use image_resolution so inputs match decoder/training
-    transform = transforms.Compose([
-        transforms.Resize(args.image_resolution),
-        transforms.CenterCrop(args.image_resolution),
-        transforms.ToTensor(),
-    ])
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+        ]
+    )
     s = time()
     print(f"Loading image folder {args.data_dir} ...")
     dataset = CustomImageFolder(args.data_dir, transform=transform)
