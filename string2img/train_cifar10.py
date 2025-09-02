@@ -54,7 +54,7 @@ Assumptions
 - image_resolution matches the training/eval pipeline (e.g., 32 for CIFAR-10).
 
 Author: Amanda + Chansen
-Citation: 
+Citation: https://github.com/yunqing-me/WatermarkDM.git
 """
 
 import argparse

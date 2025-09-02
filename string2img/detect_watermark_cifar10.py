@@ -1,7 +1,17 @@
+"""
+Detect watermarks with a pretrained StegaStamp decoder.
+
+Minimal changes from original:
+- Flat-folder loader for Colab CIFAR-10 export (no class subdirs).
+- Optional --ground_truth_fp for fixed-bitstring evaluation (Method A).
+- Match train/embed preprocessing (Resize -> CenterCrop -> ToTensor).
+
+Author: Amanda + Chansen
+Citation: https://github.com/yunqing-me/WatermarkDM.git
+"""
 import argparse
 import glob
 import PIL
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data_dir", type=str, help="Directory with images.")
@@ -25,7 +35,9 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument(
     "--check", action="store_true", help="Validate fingerprint detection accuracy."
 )
-
+# NEW: fixed watermark for detection: If provided, the same bitstring is used for accuracy.
+parser.add_argument("--ground_truth_fp", type=str, default=None,
+                    help="Fixed binary string (e.g., '0101...') used as GT for all images.")
 args = parser.parse_args()
 
 import os
@@ -45,16 +57,22 @@ from torchvision.datasets import ImageFolder
 from torchvision import transforms
 
 
-if int(args.cuda) == -1:
+# -----------------------------
+# Device
+# -----------------------------
+if int(args.cuda) == -1 or not torch.cuda.is_available():
     device = torch.device("cpu")
 else:
-    device = torch.device("cuda")
+    device = torch.device(f"cuda:{int(args.cuda)}" if isinstance(args.cuda, int) else "cuda")
 
 
+# -----------------------------
+# Dataset: flat Colab folder
+# -----------------------------
 class CustomImageFolder(Dataset):
     """
-    Read images from a single flat directory of files
-    like 00000.png ... 49999.png (no class subdirs), and force RGB.
+    CHANGE (Colab): read images from a single flat directory (e.g., 00000.png..).
+    Force RGB to match decoder’s 3-channel expectation.
     """
     def __init__(self, data_dir, transform=None):
         self.data_dir = data_dir
@@ -66,8 +84,7 @@ class CustomImageFolder(Dataset):
 
     def __getitem__(self, idx):
         filename = self.filenames[idx]
-        # Ensure 3-channel input expected by the decoder
-        image = PIL.Image.open(filename).convert("RGB")
+        image = PIL.Image.open(filename).convert("RGB") # 3 channel
         if self.transform:
             image = self.transform(image)
         return image, 0
@@ -75,91 +92,102 @@ class CustomImageFolder(Dataset):
     def __len__(self):
         return len(self.filenames)
 
-
-def load_decoder():
-    global RevealNet
-    global FINGERPRINT_SIZE
-
-    from models import StegaStampDecoder
-    # Load once to the active device; reuse for shape + weights
-    state_dict = torch.load(args.decoder_path, map_location=device)
-    FINGERPRINT_SIZE = state_dict["dense.2.weight"].shape[0]
-
-    RevealNet = StegaStampDecoder(args.image_resolution, 3, FINGERPRINT_SIZE)
-    RevealNet.load_state_dict(state_dict)
-    RevealNet = RevealNet.to(device)
-    RevealNet.eval() # PyTorch call that switches the model to evaluation mode. To prevent outputs being noisy or batch-dependent
-
-
+# -----------------------------
+# Data loading (match train/embed preprocessing)
+# -----------------------------
 def load_data():
     global dataset, dataloader
-
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-        ]
-    )
-    s = time()
+    transform = transforms.Compose([
+        transforms.Resize(args.image_resolution),
+        transforms.CenterCrop(args.image_resolution),
+        transforms.ToTensor(),
+    ])
     print(f"Loading image folder {args.data_dir} ...")
+    t0 = time()
     dataset = CustomImageFolder(args.data_dir, transform=transform)
-    print(f"Finished. Loading took {time() - s:.2f}s")
+    print(f"Finished. Loading took {time() - t0:.2f}s")
+    dataloader = DataLoader(dataset, batch_size=args.batch_size,
+                            shuffle=False, num_workers=0)
 
 
+# -----------------------------
+# Model loading 
+# -----------------------------
+def load_decoder():
+    global RevealNet, FINGERPRINT_SIZE
+    from models import StegaStampDecoder
+
+    # Load weights on the active device once; also lets us read fingerprint size
+    state_dict = torch.load(args.decoder_path, map_location=device)
+    # Original repo convention:
+    FINGERPRINT_SIZE = state_dict["dense.2.weight"].shape[0]
+
+    RevealNet = StegaStampDecoder(
+        resolution=args.image_resolution,
+        IMAGE_CHANNELS=3,
+        fingerprint_size=FINGERPRINT_SIZE
+    ).to(device)
+    RevealNet.load_state_dict(state_dict)
+    RevealNet.eval()  # inference mode
+
+
+# -----------------------------
+# Detection (fixed GT optional)
+# -----------------------------
 def extract_fingerprints():
-    all_fingerprinted_images = []
-    all_fingerprints = []
-    bitwise_accuracy = 0
+    total_correct = 0.0
+    total_seen = 0
 
-    BATCH_SIZE = args.batch_size
-    
-    # transform gt_fingerprints to 
-    gt_fingerprints  = "0100"
-    fingerprint_size = len(gt_fingerprints)
-    z = torch.zeros((args.batch_size, fingerprint_size), dtype=torch.float)
-    for (i, fp) in enumerate(gt_fingerprints):
-        z[:, i] = int(fp)
-    # Respect CPU mode (e.g., --cuda -1) as well as GPU
-    z = z.to(device)
+    # If a fixed GT bitstring is provided, parse it once to a 1×F tensor
+    gt_bits_1x = None
+    if args.ground_truth_fp is not None:
+        bits = [int(b) for b in args.ground_truth_fp.strip()]
+        if len(bits) != FINGERPRINT_SIZE:
+            raise ValueError(
+                f"--ground_truth_fp length ({len(bits)}) "
+                f"does not match decoder fingerprint size ({FINGERPRINT_SIZE})."
+            )
+        gt_bits_1x = torch.tensor(bits, dtype=torch.float32, device=device).unsqueeze(0)
 
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    # Optional: collect predictions for saving
+    detected_lines = []
 
-    for images, _ in tqdm(dataloader):
-        images = images.to(device)
+    with torch.no_grad():
+        for b, (images, _) in enumerate(tqdm(dataloader, desc="Detecting")):
+            images = images.to(device)
+            logits = RevealNet(images)
+            preds = (logits > 0).float()           # B×F, values in {0,1}
 
-        fingerprints = RevealNet(images)
-        fingerprints = (fingerprints > 0).long()
+            # Save predictions (filename + bits) if requested
+            for i in range(images.size(0)):
+                idx = total_seen + i
+                fname = os.path.basename(dataset.filenames[idx])
+                bits = "".join(str(int(x)) for x in preds[i].cpu().tolist())
+                detected_lines.append(f"{fname} {bits}")
 
-        bitwise_accuracy += (fingerprints[: images.size(0)].detach() == z[: images.size(0)]).float().mean(dim=1).sum().item()
+            # If GT was provided, compute batch accuracy vs the same fixed GT
+            if gt_bits_1x is not None:
+                gt_batch = gt_bits_1x.expand(images.size(0), -1)  # B×F
+                batch_acc = 1.0 - torch.mean(torch.abs(preds - gt_batch)).item()
+                total_correct += batch_acc * images.size(0)
 
-        all_fingerprinted_images.append(images.detach().cpu())
-        all_fingerprints.append(fingerprints.detach().cpu())
+            total_seen += images.size(0)
 
-    dirname = args.output_dir
-    # if not os.path.exists(dirname):
-    #     os.makedirs(dirname)
-    
-    all_fingerprints = torch.cat(all_fingerprints, dim=0).cpu()
-    bitwise_accuracy = bitwise_accuracy / len(all_fingerprints)
-    print(f"Bitwise accuracy on fingerprinted images: {bitwise_accuracy}") # non-corrected
-          
-    # write in file
-    # f = open(os.path.join(args.output_dir, "detected_fingerprints.txt"), "w")
-    # for idx in range(len(all_fingerprints)):
-    #     fingerprint = all_fingerprints[idx]
-    #     fingerprint_str = "".join(map(str, fingerprint.cpu().long().numpy().tolist()))
-    #     _, filename = os.path.split(dataset.filenames[idx])
-    #     filename = filename.split('.')[0] + ".png"
-    #     f.write(f"{filename} {fingerprint_str}\n")
-    # f.close()
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        out_path = os.path.join(args.output_dir, "detected_fingerprints.txt")
+        with open(out_path, "w") as f:
+            f.write("\n".join(detected_lines))
+        print(f"Saved predictions to: {out_path}")
+
+    if gt_bits_1x is not None and total_seen > 0:
+        print(f"\nBitwise accuracy (vs fixed GT): {total_correct / total_seen:.4f}")
 
 
 def main():
-    # Use the CLI as-is; Colab export is already a single flat folder.
     load_decoder()
     load_data()
     extract_fingerprints()
-    
-
 
 if __name__ == "__main__":
     main()

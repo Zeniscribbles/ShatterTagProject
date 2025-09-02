@@ -27,7 +27,7 @@ python embed_watermark_cifar10.py \
   --check --decoder_path "/path/to/*_decoder_last.pth"
 
 Author: Amanda + Chansen
-Citation:
+Citation: https://github.com/yunqing-me/WatermarkDM.git
 """
 
 import argparse
