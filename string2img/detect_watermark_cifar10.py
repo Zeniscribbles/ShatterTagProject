@@ -1,167 +1,171 @@
-"""
-Detect watermarks from images using a pretrained StegaStamp decoder.
-
-This script loads a trained decoder and attempts to recover embedded
-bitstrings from a directory of images (typically those produced by an
-embedding step). It can optionally compute bitwise accuracy if a single
-ground-truth fingerprint is provided.
-
-Typical use
------------
-Run from a terminal or Colab:
-
-    python detect_watermark_cifar10.py \
-        --decoder_path /path/to/checkpoints/*_decoder_last.pth \
-        --data_dir /path/to/images \
-        --output_dir ./detections \
-        --image_resolution 32 \
-        --batch_size 128 \
-        --cuda 0
-
-Inputs
-------
-- decoder checkpoint (.pth): produced by the training pipeline, matching the
-  model architecture and bit length used during training.
-- images: .png/.jpg/.jpeg files located directly under --data_dir
-  (non-recursive in this implementation).
-
-Outputs
--------
-- detected_fingerprints.txt (under --output_dir): one line per image with
-  "filename <bitstring>".
-- If --ground_truth_fp is provided, the script prints overall bitwise accuracy.
-
-Notes
------
-- --image_resolution must match training (e.g., 32 for CIFAR-10).
-- This script uses a non-recursive file search; point --data_dir at the leaf
-  folder that actually contains the images.
-- CUDA device selection: pass --cuda -1 to force CPU, or an integer index
-  (0, 1, ...) to pick a GPU when available.
-
-Author: Amanda + Chansen
-"""
-
 import argparse
-import os
 import glob
-import torch
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
-from tqdm import tqdm
+import PIL
 
-# -----------------------------
-# Argument Parsing
-# -----------------------------
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--data_dir", type=str, help="Directory with fingerprinted images.")
-parser.add_argument("--output_dir", type=str, help="Directory to save detected fingerprints.")
-parser.add_argument("--image_resolution", type=int, default=32, help="Input image resolution (square).")
-parser.add_argument("--decoder_path", type=str, help="Path to trained StegaStamp decoder.")
-parser.add_argument("--batch_size", type=int, default=64, help="Batch size for evaluation.")
-parser.add_argument("--cuda", type=int, default=0, help="Use CUDA device index or -1 for CPU.")
-parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
-parser.add_argument("--ground_truth_fp", type=str, default=None, help="Optional ground truth binary string for bitwise accuracy.")
+parser.add_argument("--data_dir", type=str, help="Directory with images.")
+parser.add_argument(
+    "--output_dir", type=str, help="Path to save watermarked images to."
+)
+parser.add_argument(
+    "--image_resolution",
+    type=int,
+    help="Height and width of square images.",
+)
+parser.add_argument(
+    "--decoder_path",
+    type=str,
+    help="Path to trained StegaStamp decoder.",
+)
+parser.add_argument("--batch_size", type=int, default=64, help="Batch size.")
+parser.add_argument("--cuda", type=int, default=0)
+parser.add_argument("--seed", type=int, default=42)
+
+parser.add_argument(
+    "--check", action="store_true", help="Validate fingerprint detection accuracy."
+)
+
 args = parser.parse_args()
 
-# -----------------------------
-# Setup
-# -----------------------------
-torch.manual_seed(args.seed)
-device = torch.device("cuda" if args.cuda != -1 and torch.cuda.is_available() else "cpu")
+import os
 
-# -----------------------------
-# Dataset Definition
-# -----------------------------
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda)
+
+from time import time
+from tqdm import tqdm
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision.utils import save_image
+from torchvision.datasets import ImageFolder
+from torchvision import transforms
+
+
+if int(args.cuda) == -1:
+    device = torch.device("cpu")
+else:
+    device = torch.device("cuda")
+
+
 class CustomImageFolder(Dataset):
+    """
+    Read images from a single flat directory of files
+    like 00000.png ... 49999.png (no class subdirs), and force RGB.
+    """
     def __init__(self, data_dir, transform=None):
-        self.filenames = sorted(
-            glob.glob(os.path.join(data_dir, "*.png"))
-            + glob.glob(os.path.join(data_dir, "*.jpg"))
-            + glob.glob(os.path.join(data_dir, "*.jpeg"))
-        )
-        if not self.filenames:
-            raise RuntimeError(f"No images found in {data_dir}")
-        self.transform = transform or transforms.ToTensor()
+        self.data_dir = data_dir
+        self.filenames = glob.glob(os.path.join(data_dir, "*.png"))
+        self.filenames.extend(glob.glob(os.path.join(data_dir, "*.jpeg")))
+        self.filenames.extend(glob.glob(os.path.join(data_dir, "*.jpg")))
+        self.filenames = sorted(self.filenames)
+        self.transform = transform
 
     def __getitem__(self, idx):
-        image = Image.open(self.filenames[idx]).convert("RGB")
-        return self.transform(image), 0
+        filename = self.filenames[idx]
+        # Ensure 3-channel input expected by the decoder
+        image = PIL.Image.open(filename).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        return image, 0
 
     def __len__(self):
         return len(self.filenames)
 
-# -----------------------------
-# Model Loading
-# -----------------------------
+
 def load_decoder():
+    global RevealNet
+    global FINGERPRINT_SIZE
+
     from models import StegaStampDecoder
+    # Load once to the active device; reuse for shape + weights
     state_dict = torch.load(args.decoder_path, map_location=device)
+    FINGERPRINT_SIZE = state_dict["dense.2.weight"].shape[0]
 
-    fingerprint_size = state_dict["dense.2.weight"].shape[0]
-    decoder = StegaStampDecoder(
-        resolution=args.image_resolution,
-        IMAGE_CHANNELS=3,
-        fingerprint_size=fingerprint_size
-    )
-    decoder.load_state_dict(state_dict)
-    decoder.to(device).eval()
-    return decoder, fingerprint_size
+    RevealNet = StegaStampDecoder(args.image_resolution, 3, FINGERPRINT_SIZE).to(device)
+    RevealNet.load_state_dict(state_dict)
+    RevealNet.eval() # PyTorch call that switches the model to evaluation mode. To prevent outputs being noisy or batch-dependent
 
-# -----------------------------
-# Fingerprint Detection
-# -----------------------------
-def extract_fingerprints(decoder, fingerprint_size):
+
+def load_data():
+    global dataset, dataloader
+
+#    transform = transforms.Compose(
+#        [
+#           transforms.ToTensor(),
+#        ]
+#    )
+
+    # Use image_resolution so inputs match decoder/training
     transform = transforms.Compose([
         transforms.Resize(args.image_resolution),
         transforms.CenterCrop(args.image_resolution),
         transforms.ToTensor(),
     ])
-
+    s = time()
+    print(f"Loading image folder {args.data_dir} ...")
     dataset = CustomImageFolder(args.data_dir, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    print(f"Finished. Loading took {time() - s:.2f}s")
 
+
+def extract_fingerprints():
+    all_fingerprinted_images = []
     all_fingerprints = []
-    accuracy_sum = 0
+    bitwise_accuracy = 0
 
-    # Prepare GT if provided
-    if args.ground_truth_fp:
-        assert len(args.ground_truth_fp) == fingerprint_size, "GT fingerprint size mismatch"
-        gt_tensor = torch.tensor([int(b) for b in args.ground_truth_fp], dtype=torch.float).unsqueeze(0)
-        gt_tensor = gt_tensor.expand(args.batch_size, -1).to(device)
+    BATCH_SIZE = args.batch_size
+    
+    # transform gt_fingerprints to 
+    gt_fingerprints  = "0100"
+    fingerprint_size = len(gt_fingerprints)
+    z = torch.zeros((args.batch_size, fingerprint_size), dtype=torch.float)
+    for (i, fp) in enumerate(gt_fingerprints):
+        z[:, i] = int(fp)
+    # Respect CPU mode (e.g., --cuda -1) as well as GPU
+    z = z.to(device)
 
-    print(f"Running detection on {len(dataset)} images...")
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    for images, _ in tqdm(dataloader, desc="Detecting"):
+    for images, _ in tqdm(dataloader):
         images = images.to(device)
-        with torch.no_grad():
-            output = decoder(images)
-            predicted = (output > 0).float()
 
-        if args.ground_truth_fp:
-            batch_acc = 1.0 - torch.mean(torch.abs(predicted - gt_tensor[:images.size(0)]))
-            accuracy_sum += batch_acc.item() * images.size(0)
+        fingerprints = RevealNet(images)
+        fingerprints = (fingerprints > 0).long()
 
-        all_fingerprints.append(predicted.cpu())
+        bitwise_accuracy += (fingerprints[: images.size(0)].detach() == z[: images.size(0)]).float().mean(dim=1).sum().item()
 
-    all_fingerprints = torch.cat(all_fingerprints, dim=0)
+        all_fingerprinted_images.append(images.detach().cpu())
+        all_fingerprints.append(fingerprints.detach().cpu())
 
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        with open(os.path.join(args.output_dir, "detected_fingerprints.txt"), "w") as f:
-            for idx, fp in enumerate(all_fingerprints):
-                filename = os.path.basename(dataset.filenames[idx])
-                bits = "".join(str(int(b)) for b in fp.tolist())
-                f.write(f"{filename} {bits}\n")
+    dirname = args.output_dir
+    # if not os.path.exists(dirname):
+    #     os.makedirs(dirname)
+    
+    all_fingerprints = torch.cat(all_fingerprints, dim=0).cpu()
+    bitwise_accuracy = bitwise_accuracy / len(all_fingerprints)
+    print(f"Bitwise accuracy on fingerprinted images: {bitwise_accuracy}") # non-corrected
+          
+    # write in file
+    # f = open(os.path.join(args.output_dir, "detected_fingerprints.txt"), "w")
+    # for idx in range(len(all_fingerprints)):
+    #     fingerprint = all_fingerprints[idx]
+    #     fingerprint_str = "".join(map(str, fingerprint.cpu().long().numpy().tolist()))
+    #     _, filename = os.path.split(dataset.filenames[idx])
+    #     filename = filename.split('.')[0] + ".png"
+    #     f.write(f"{filename} {fingerprint_str}\n")
+    # f.close()
 
-    if args.ground_truth_fp:
-        final_accuracy = accuracy_sum / len(dataset)
-        print(f"\nBitwise accuracy: {final_accuracy:.4f}")
 
-# -----------------------------
-# Entry Point
-# -----------------------------
+def main():
+    # Use the CLI as-is; Colab export is already a single flat folder.
+    load_decoder()
+    load_data()
+    extract_fingerprints()
+    
+
+
 if __name__ == "__main__":
-    decoder, fingerprint_size = load_decoder()
-    extract_fingerprints(decoder, fingerprint_size)
+    main()
