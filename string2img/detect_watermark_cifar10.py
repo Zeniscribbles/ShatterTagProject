@@ -85,7 +85,7 @@ def load_decoder():
     state_dict = torch.load(args.decoder_path, map_location=device)
     FINGERPRINT_SIZE = state_dict["dense.2.weight"].shape[0]
 
-    RevealNet = StegaStampDecoder(args.image_resolution, 3, FINGERPRINT_SIZE).to(device)
+    RevealNet = StegaStampDecoder(args.image_resolution, 3, FINGERPRINT_SIZE)
     RevealNet.load_state_dict(state_dict)
     RevealNet = RevealNet.to(device)
     RevealNet.eval() # PyTorch call that switches the model to evaluation mode. To prevent outputs being noisy or batch-dependent
