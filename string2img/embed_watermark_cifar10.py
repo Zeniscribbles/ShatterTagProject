@@ -26,6 +26,24 @@ python embed_watermark_cifar10.py \
   --identical_fingerprints \
   --check --decoder_path "/path/to/*_decoder_last.pth"
 
+  Running with Identical Fingerprints for Detection:
+  --------------------------------------------------
+  python /content/drive/MyDrive/ShatterTagProject/string2img/embed_watermark_cifar10.py \
+  --encoder_path "/content/drive/MyDrive/ShatterTagProject/output/cifar10_run1/checkpoints/*_encoder_last.pth" \
+  --decoder_path "/content/drive/MyDrive/ShatterTagProject/output/cifar10_run1/checkpoints/*_decoder_last.pth" \
+  --data_dir "/content/drive/MyDrive/ShatterTagProject/data/cifar10" \
+  --output_dir "/content/drive/MyDrive/ShatterTagProject/output/cifar10_run1/embedded_ident" \
+  --output_dir_note "/content/drive/MyDrive/ShatterTagProject/output/cifar10_run1/notes_ident" \
+  --image_resolution 32 \
+  --batch_size 64 \
+  --seed 42 \
+  --identical_fingerprints \
+  --check
+
+    Then open: /content/drive/MyDrive/ShatterTagProject/output/cifar10_run1/notes_ident/embedded_fingerprints.txt
+    Copy the single bitstring in there and pass it to the detector 
+    (the fixed-bitstring) via its --ground_truth_fp (or equivalent) flag.
+
 Author: Amanda + Chansen
 Citation: https://github.com/yunqing-me/WatermarkDM.git
 """
