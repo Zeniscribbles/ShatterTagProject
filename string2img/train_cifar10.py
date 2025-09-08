@@ -118,6 +118,13 @@ parser.add_argument(
     help="BCE loss weight for fingerprint reconstruction.",
 )
 
+# --- For CIFAR10 dataset ---
+parser.add_argument("--use_cifar10", action="store_true",
+                    help="Use torchvision.datasets.CIFAR10 instead of a flat image folder.")
+parser.add_argument("--cifar10_root", type=str, default="./_data",
+                    help="Where to download/store CIFAR-10 when --use_cifar10 is set.")
+
+
 args = parser.parse_args()
 
 
@@ -135,6 +142,7 @@ import PIL
 
 import torch
 from torch import nn
+from torchvision.datasets import CIFAR10
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.utils import make_grid
@@ -223,7 +231,6 @@ def load_data():
 
     IMAGE_RESOLUTION = args.image_resolution
     IMAGE_CHANNELS = 3
-
     SECRET_SIZE = args.bit_length
 
     if args.use_celeba_preprocessing:
@@ -236,7 +243,6 @@ def load_data():
             ]
         )
     else:
-
         transform = transforms.Compose(
             [
                 transforms.Resize(IMAGE_RESOLUTION),
@@ -244,6 +250,13 @@ def load_data():
                 transforms.ToTensor(),
             ]
         )
+    
+    if args.use_cifar10:
+        print(f"Loading CIFAR-10 (root={args.cifar10_root}) ...")
+        dataset = CIFAR10(root=args.cifar10_root, train=True, download=True, transform=transform)
+    else:
+        print(f"Loading image folder {args.data_dir} ...")
+        dataset = CustomImageFolder(args.data_dir, transform=transform)
 
     s = time()
     print(f"Loading image folder {args.data_dir} ...")
