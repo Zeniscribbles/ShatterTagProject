@@ -435,6 +435,24 @@ def main():
                 f = open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w")
                 f.write(str(global_step))
                 f.close()
+    
+    # ----- final save so _last always updates -----
+    torch.save(
+        decoder_encoder_optim.state_dict(),
+        join(CHECKPOINTS_PATH, EXP_NAME + "_optim_last.pth"),
+    )
+    torch.save(
+        encoder.state_dict(),
+        join(CHECKPOINTS_PATH, EXP_NAME + "_encoder_last.pth"),
+    )
+    torch.save(
+        decoder.state_dict(),
+        join(CHECKPOINTS_PATH, EXP_NAME + "_decoder_last.pth"),
+    )
+    with open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w") as f:
+        f.write(str(global_step))
+# ---------------------------------------------
+
 
     # writer.export_scalars_to_json("./all_scalars.json")
     writer.close()
