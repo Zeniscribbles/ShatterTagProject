@@ -60,9 +60,9 @@ Citation: https://github.com/yunqing-me/WatermarkDM.git
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--data_dir", type=str, required=True, help="Directory with image dataset."
-)
+#parser.add_argument(
+#    "--data_dir", type=str, required=True, help="Directory with image dataset."
+#)
 parser.add_argument(
     "--use_celeba_preprocessing",
     action="store_true",
@@ -251,6 +251,7 @@ def load_data():
             ]
         )
     
+    s = time()
     if args.use_cifar10:
         print(f"Loading CIFAR-10 (root={args.cifar10_root}) ...")
         dataset = CIFAR10(root=args.cifar10_root, train=True, download=True, transform=transform)
@@ -258,10 +259,6 @@ def load_data():
         print(f"Loading image folder {args.data_dir} ...")
         dataset = CustomImageFolder(args.data_dir, transform=transform)
 
-    s = time()
-    print(f"Loading image folder {args.data_dir} ...")
-    # CHANGE: use the flat-folder loader instead of the original (which expected shards/class dirs)
-    dataset = CustomImageFolder(args.data_dir, transform=transform)
     print(f"Finished. Loading took {time() - s:.2f}s")
 
 
