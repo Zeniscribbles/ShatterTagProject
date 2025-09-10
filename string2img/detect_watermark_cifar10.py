@@ -124,22 +124,18 @@ def load_data():
 # Model loading 
 # -----------------------------
 def load_decoder():
-    global RevealNet, FINGERPRINT_SIZE
+    def load_decoder():
+        global RevealNet, FINGERPRINT_SIZE
     from models import StegaStampDecoder
 
-    # Load weights on the active device once; also lets us read fingerprint size
     state_dict = torch.load(args.decoder_path, map_location=device)
-    # Original repo convention:
+    # If your decoder’s final layer is named differently, swap the key below.
     FINGERPRINT_SIZE = state_dict["dense.2.weight"].shape[0]
 
-    RevealNet = StegaStampDecoder(
-        resolution=args.image_resolution,
-        IMAGE_CHANNELS=3,
-        fingerprint_size=FINGERPRINT_SIZE
-    ).to(device)
+    # Use positional args: (image_resolution, channels, fingerprint_size)
+    RevealNet = StegaStampDecoder(args.image_resolution, 3, FINGERPRINT_SIZE).to(device)
     RevealNet.load_state_dict(state_dict)
-    RevealNet.eval()  # inference mode
-
+    RevealNet.eval()
 
 # -----------------------------
 # Detection (fixed GT optional)
