@@ -45,6 +45,11 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument(
     "--check", action="store_true", help="Validate fingerprint detection accuracy."
 )
+parser.add_argument(
+    "--encoder_path", type=str, default=None,
+    help="(Optional) Matching StegaStamp encoder .pth used for training; used to infer bit length."
+)
+
 # NEW: fixed watermark for detection: If provided, the same bitstring is used for accuracy.
 parser.add_argument("--ground_truth_fp", type=str, default=None,
                     help="Fixed binary string (e.g., '0101...') used as GT for all images.")
@@ -124,18 +129,44 @@ def load_data():
 # Model loading 
 # -----------------------------
 def load_decoder():
-    def load_decoder():
-        global RevealNet, FINGERPRINT_SIZE
+    global RevealNet, FINGERPRINT_SIZE
     from models import StegaStampDecoder
 
-    state_dict = torch.load(args.decoder_path, map_location=device)
-    # If your decoder’s final layer is named differently, swap the key below.
-    FINGERPRINT_SIZE = state_dict["dense.2.weight"].shape[0]
+    # Always load on CPU first; we’ll move the model to device afterward.
+    dec_sd = torch.load(args.decoder_path, map_location="cpu")
 
-    # Use positional args: (image_resolution, channels, fingerprint_size)
-    RevealNet = StegaStampDecoder(args.image_resolution, 3, FINGERPRINT_SIZE).to(device)
-    RevealNet.load_state_dict(state_dict)
+    # --- Option B: infer bit-length from encoder checkpoint when provided ---
+    FINGERPRINT_SIZE = None
+    if args.encoder_path is not None and os.path.exists(args.encoder_path):
+        enc_sd = torch.load(args.encoder_path, map_location="cpu")
+        # Original StegaStamp encoders keep the bit size on the secret/projection layer
+        if "secret_dense.weight" in enc_sd:
+            FINGERPRINT_SIZE = enc_sd["secret_dense.weight"].shape[-1]
+        else:
+            # Fallback: try to find a key that ends with 'secret_dense.weight'
+            cand = [k for k in enc_sd.keys() if k.endswith("secret_dense.weight")]
+            if cand:
+                FINGERPRINT_SIZE = enc_sd[cand[0]].shape[-1]
+
+    # --- If no encoder provided (or fallback failed), infer from the decoder checkpoint ---
+    if FINGERPRINT_SIZE is None:
+        # Pick the linear weight whose out_features equals the smallest 2D .weight[0]
+        # In typical StegaStamp, MLP is 512->512-><bits>; min out_features = <bits>.
+        candidates = [
+            (k, v.shape) for k, v in dec_sd.items()
+            if k.endswith(".weight") and v.ndim == 2
+        ]
+        if not candidates:
+            raise RuntimeError("Could not find any 2D linear weights in decoder checkpoint.")
+        FINGERPRINT_SIZE = min(shp[0] for _, shp in candidates)
+
+    # Build and load the decoder with the inferred bit-length
+    RevealNet = StegaStampDecoder(
+        args.image_resolution, 3, FINGERPRINT_SIZE
+    ).to(device)
+    RevealNet.load_state_dict(dec_sd)
     RevealNet.eval()
+
 
 # -----------------------------
 # Detection (fixed GT optional)
