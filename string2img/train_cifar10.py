@@ -59,7 +59,8 @@ Citation: https://github.com/yunqing-me/WatermarkDM.git
 import argparse
 import os
 from os.path import join
-from time import time
+from datetime import datetime
+import time  # For time.time()
 
 import glob
 import PIL
@@ -286,6 +287,9 @@ def load_data():
     print(f"Finished. Loading took {time() - s:.2f}s")
     print(f"Dataset size: {len(dataset)} images")
 
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     now = datetime.now()
     dt_string = now.strftime("%d%m%Y_%H:%M:%S")
@@ -294,22 +298,44 @@ def main():
     device = parse_device(args.cuda)
     print(f"Using device: {device}")
 
-    # ------------------------------ NEW: build subset + loader once ------------------------------
-    transform_train = transforms.Compose([
-        transforms.ToTensor(),
-    ])
+    IMAGE_CHANNELS = 3  # <-- used by models: CIFAR-10: shape [3, 32, 32] → 3 color channels → IMAGE_CHANNELS = 3
 
-    # Do NOT redownload if you already have it
-    train_full = CIFAR10(root=args.cifar10_root, train=True, download=False, transform=transform_train)
-
-    if args.subset_size and args.subset_size > 0:
-        g = torch.Generator().manual_seed(args.subset_seed)
-        idx = torch.randperm(len(train_full), generator=g)[:args.subset_size]
-        train_set = Subset(train_full, idx.tolist())
-        print(f"[Data] Using CIFAR-10 subset: {len(train_set)} / {len(train_full)}")
+    # Transforms
+    if args.use_celeba_preprocessing:
+        assert args.image_resolution == 128, f"CelebA preprocessing requires 128x128, got {args.image_resolution}."
+        transform_train = transforms.Compose([
+            transforms.CenterCrop(148),
+            transforms.Resize(128),
+            transforms.ToTensor(),
+        ])
     else:
-        train_set = train_full
-        print(f"[Data] Using full CIFAR-10 train set: {len(train_set)}")
+        transform_train = transforms.Compose([
+            transforms.Resize(args.image_resolution),
+            transforms.CenterCrop(args.image_resolution),
+            transforms.ToTensor(),
+        ])
+
+    # Dataset (CIFAR-10 recommended)
+    if args.use_cifar10:
+        print(f"Loading CIFAR-10 (root={args.cifar10_root}) ...")
+        # download=True won't re-download if already cached
+        train_full = CIFAR10(root=args.cifar10_root, train=True, download=True,
+                             transform=(transforms.ToTensor() if args.image_resolution == 32 else transform_train))
+        if args.subset_size and args.subset_size > 0:
+            print(f"Sampling {args.subset_size} images from CIFAR-10 (seed={args.subset_seed})")
+            g = torch.Generator().manual_seed(args.subset_seed)
+            idx = torch.randperm(len(train_full), generator=g)[:args.subset_size]
+            train_set = Subset(train_full, idx.tolist())
+            print(f"[Data] Using CIFAR-10 subset: {len(train_set)} / {len(train_full)}")
+        else:
+            train_set = train_full
+            print(f"[Data] Using full CIFAR-10 train set: {len(train_set)}")
+    else:
+        if not args.data_dir:
+            raise ValueError("--data_dir must be set when --use_cifar10 is not provided.")
+        print(f"Loading image folder {args.data_dir} ...")
+        train_set = CustomImageFolder(args.data_dir, transform=transform_train)
+        print(f"[Data] Using flat-folder dataset: {len(train_set)} images")
 
     train_loader = DataLoader(
         train_set,
@@ -320,8 +346,8 @@ def main():
         persistent_workers=args.num_workers > 0,
         drop_last=True,
     )
-    # ---------------------------------------------------------------------------------------------
 
+    # Models
     encoder = models.StegaStampEncoder(
         args.image_resolution,
         IMAGE_CHANNELS,
@@ -336,31 +362,22 @@ def main():
     encoder = encoder.to(device)
     decoder = decoder.to(device)
 
-    decoder_encoder_optim = Adam(
-        params=list(decoder.parameters()) + list(encoder.parameters()), lr=args.lr
-    )
+    decoder_encoder_optim = Adam(params=list(decoder.parameters()) + list(encoder.parameters()), lr=args.lr)
+
+    torch.backends.cudnn.benchmark = True
 
     global_step = 0
     steps_since_l2_loss_activated = -1
 
     for i_epoch in range(args.num_epochs):
-        # NOTE: we iterate over the prebuilt train_loader; do NOT rebuild a new DataLoader here.
         for images, _ in tqdm(train_loader):
             global_step += 1
 
-            # Current batch size (after drop_last) is images.size(0)
             bsz = images.size(0)
-            fingerprints = generate_random_fingerprints(
-                args.bit_length, bsz, (args.image_resolution, args.image_resolution)
-            )
+            fingerprints = generate_random_fingerprints(args.bit_length, bsz, (args.image_resolution, args.image_resolution))
 
             l2_loss_weight = min(
-                max(
-                    0,
-                    args.l2_loss_weight
-                    * (steps_since_l2_loss_activated - args.l2_loss_await)
-                    / args.l2_loss_ramp,
-                ),
+                max(0, args.l2_loss_weight * (steps_since_l2_loss_activated - args.l2_loss_await) / args.l2_loss_ramp),
                 args.l2_loss_weight,
             )
             BCE_loss_weight = args.BCE_loss_weight
@@ -373,16 +390,13 @@ def main():
 
             decoder_output = decoder(fingerprinted_images)
 
-            criterion = nn.MSELoss()
-            l2_loss = criterion(fingerprinted_images, clean_images)
-
-            criterion = nn.BCEWithLogitsLoss()
-            BCE_loss = criterion(decoder_output.view(-1), fingerprints.view(-1))
+            l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
+            BCE_loss = nn.BCEWithLogitsLoss()(decoder_output.view(-1), fingerprints.view(-1))
 
             loss = l2_loss_weight * l2_loss + BCE_loss_weight * BCE_loss
 
-            encoder.zero_grad()
-            decoder.zero_grad()
+            encoder.zero_grad(set_to_none=True)
+            decoder.zero_grad(set_to_none=True)
             loss.backward()
             decoder_encoder_optim.step()
 
@@ -395,62 +409,36 @@ def main():
             else:
                 steps_since_l2_loss_activated += 1
 
-            # --- your logging / checkpointing block stays the same below ---
             if global_step in plot_points:
                 writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
                 writer.add_scalar("loss", loss.item(), global_step)
                 writer.add_scalar("BCE_loss", BCE_loss.item(), global_step)
-                writer.add_scalars(
-                    "clean_statistics",
-                    {"min": clean_images.min(), "max": clean_images.max()},
-                    global_step,
-                )
-                writer.add_scalars(
-                    "with_fingerprint_statistics",
-                    {"min": fingerprinted_images.min(), "max": fingerprinted_images.max()},
-                    global_step,
-                )
-                writer.add_scalars(
-                    "residual_statistics",
-                    {
-                        "min": residual.min(),
-                        "max": residual.max(),
-                        "mean_abs": residual.abs().mean(),
-                    },
-                    global_step,
-                )
-                print(
-                    "residual_statistics: {}".format(
-                        {
-                            "min": residual.min(),
-                            "max": residual.max(),
-                            "mean_abs": residual.abs().mean(),
-                        }
-                    )
-                )
+
+                writer.add_scalars("clean_statistics", {"min": clean_images.min(), "max": clean_images.max()}, global_step)
+                writer.add_scalars("with_fingerprint_statistics", {"min": fingerprinted_images.min(), "max": fingerprinted_images.max()}, global_step)
+                writer.add_scalars("residual_statistics", {"min": residual.min(), "max": residual.max(), "mean_abs": residual.abs().mean()}, global_step)
+
                 writer.add_image("clean_image", make_grid(clean_images, normalize=True), global_step)
                 writer.add_image("residual", make_grid(residual, normalize=True, scale_each=True), global_step)
                 writer.add_image("image_with_fingerprint", make_grid(fingerprinted_images, normalize=True), global_step)
-                save_image(
-                    fingerprinted_images,
-                    SAVED_IMAGES + "/{}.png".format(global_step),
-                    normalize=True,
-                )
+
+                save_image(fingerprinted_images, join(SAVED_IMAGES, f"{global_step}.png"), normalize=True)
+
                 writer.add_scalar("loss_weights/l2_loss_weight", l2_loss_weight, global_step)
                 writer.add_scalar("loss_weights/BCE_loss_weight", BCE_loss_weight, global_step)
 
             if global_step % 5000 == 0:
-                torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_optim.pth"))
-                torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_encoder.pth"))
-                torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_decoder.pth"))
-                with open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w") as f:
+                torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_optim.pth"))
+                torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_encoder.pth"))
+                torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_decoder.pth"))
+                with open(join(CHECKPOINTS_PATH, f"{EXP_NAME}_variables.txt"), "w") as f:
                     f.write(str(global_step))
 
     # ----- final save so _last always updates -----
-    torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_optim_last.pth"))
-    torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_encoder_last.pth"))
-    torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_decoder_last.pth"))
-    with open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w") as f:
+    torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_optim_last.pth"))
+    torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_encoder_last.pth"))
+    torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_decoder_last.pth"))
+    with open(join(CHECKPOINTS_PATH, f"{EXP_NAME}_variables.txt"), "w") as f:
         f.write(str(global_step))
 
     writer.close()
