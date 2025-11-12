@@ -56,9 +56,35 @@ Assumptions
 Author: Amanda + Chansen
 Citation: https://github.com/yunqing-me/WatermarkDM.git
 """
-
 import argparse
+import os
+from os.path import join
+from time import time
 
+import glob
+import PIL
+from tqdm import tqdm
+
+
+import torch
+from torch import nn
+from torch.optim import Adam
+from torch.utils.data import DataLoader, Subset, Dataset
+from torchvision import transforms
+from torchvision.datasets import CIFAR10
+
+# from torchvision.datasets import ImageFolder
+from torchvision.utils import make_grid, save_image
+
+#from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter # For google colab
+
+import models
+
+
+# -----------------------------
+# Args
+# -----------------------------
 parser = argparse.ArgumentParser()
 #parser.add_argument(
 #    "--data_dir", type=str, required=True, help="Directory with image dataset."
@@ -91,6 +117,7 @@ parser.add_argument(
 parser.add_argument("--batch_size", type=int, default=64, help="Batch size.")
 parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate.")
 parser.add_argument("--cuda", type=str, default="cuda")
+parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers.")
 
 parser.add_argument(
     "--l2_loss_await",
@@ -124,62 +151,35 @@ parser.add_argument("--use_cifar10", action="store_true",
 parser.add_argument("--cifar10_root", type=str, default="./_data",
                     help="Where to download/store CIFAR-10 when --use_cifar10 is set.")
 
+parser.add_argument("--data_dir", type=str, default=None,
+                    help="Flat image folder (only used when --use_cifar10 is NOT set).")
+
+
 # --- Cifar10 Subset argparse additions ---
 parser.add_argument("--subset_size", type=int, default=0,
                     help="If >0, sample this many training images from CIFAR-10.")
 parser.add_argument("--subset_seed", type=int, default=1337,
                     help="RNG seed for subset sampling.")
-parser.add_argument("--val_split", type=float, default=0.05,
-                    help="Optional fraction of the (sub)set for validation.")
-
-
 
 args = parser.parse_args()
 
 
-import glob
-import os
-from os.path import join
-from time import time
-
-# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-# os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda)
-from datetime import datetime
-
-from tqdm import tqdm
-import PIL
-
-import torch
-from torch import nn
-from torchvision.datasets import CIFAR10
-from torch.utils.data import DataLoader, Subset
-from torchvision import transforms
-from torchvision.utils import make_grid
-# from torchvision.datasets import ImageFolder
-from torchvision.utils import save_image
-#from tensorboardX import SummaryWriter // Or import in google colab
-from torch.utils.tensorboard import SummaryWriter # For google colab
-
-
-from torch.optim import Adam
-
-import models
-
-
+# -----------------------------
+# Paths (create BEFORE SummaryWriter)
+# -----------------------------
 LOGS_PATH = os.path.join(args.output_dir, "logs")
 CHECKPOINTS_PATH = os.path.join(args.output_dir, "checkpoints")
-SAVED_IMAGES = os.path.join(args.output_dir, "./saved_images")
+SAVED_IMAGES = os.path.join(args.output_dir, "saved_images")  # <- no './'
+
+os.makedirs(LOGS_PATH, exist_ok=True)
+os.makedirs(CHECKPOINTS_PATH, exist_ok=True)
+os.makedirs(SAVED_IMAGES, exist_ok=True)
 
 writer = SummaryWriter(LOGS_PATH)
 
-if not os.path.exists(LOGS_PATH):
-    os.makedirs(LOGS_PATH)
-if not os.path.exists(CHECKPOINTS_PATH):
-    os.makedirs(CHECKPOINTS_PATH)
-if not os.path.exists(SAVED_IMAGES):
-    os.makedirs(SAVED_IMAGES)
-
-
+# -----------------------------
+# Utils
+# -----------------------------
 def generate_random_fingerprints(bit_length, batch_size=4, size=(400, 400)):
     z = torch.zeros((batch_size, bit_length), dtype=torch.float).random_(0, 2)
     return z
@@ -191,9 +191,6 @@ plot_points = (
     + list(range(3000, 100000, 1000))
 )
 
-# -----------------------------
-# Device
-# -----------------------------
 def parse_device(spec: str) -> torch.device:
     s = str(spec).strip().lower()
     if s in ("-1", "cpu"):
@@ -207,12 +204,14 @@ def parse_device(spec: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# -------------------- NEW: flat-folder dataset for Colab export --------------------
-# CHANGE: replace the original dataset/sharded loader with a simple flat-folder loader.
+# -----------------------------
+# NEW: flat-folder dataset for Colab export (fallback)
+# CHANGE: replace the original dataset/sharded 
+# loader with a simple flat-folder loader.
+# -----------------------------
 class CustomImageFolder(Dataset):
     """
-    Minimal change: read a flat folder of images produced by the Colab CIFAR-10 export.
-    (e.g., /.../cifar10/00000.png ... 49999.png; no class subdirs)
+    (Optional, unused) original-style loader kept for reference. Not called.
     """
     def __init__(self, data_dir, transform=None):
         self.data_dir = data_dir
@@ -259,7 +258,7 @@ def load_data():
             transforms.ToTensor(),
         ])
     
-     s = time()
+    s = time()
     if args.use_cifar10:
         print(f"Loading CIFAR-10 (root={args.cifar10_root}) ...")
         full_dataset = CIFAR10(
@@ -296,11 +295,6 @@ def main():
     print(f"Using device: {device}")
 
     # ------------------------------ NEW: build subset + loader once ------------------------------
-    from torchvision.datasets import CIFAR10
-    from torchvision import transforms
-    from torch.utils.data import DataLoader, Subset
-    import torch
-
     transform_train = transforms.Compose([
         transforms.ToTensor(),
     ])
