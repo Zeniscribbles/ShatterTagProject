@@ -368,8 +368,15 @@ def main():
 
     global_step = 0
     steps_since_l2_loss_activated = -1
-
+    log_every = 100
+    
     for i_epoch in range(args.num_epochs):
+        print(f"\n[Train] Starting epoch {i_epoch + 1}/{args.num_epochs}")
+        
+        epoch_loss_sum = 0.0
+        epoch_bit_acc_sum = 0.0
+        epoch_batches = 0
+
         for images, _ in tqdm(train_loader):
             global_step += 1
 
@@ -409,6 +416,20 @@ def main():
             else:
                 steps_since_l2_loss_activated += 1
 
+            # ---- epoch stats accumulation ----
+            epoch_loss_sum += loss.item()
+            epoch_bit_acc_sum += bitwise_accuracy.item()
+            epoch_batches += 1
+
+            # ---- occasional console logging ----
+            if global_step % log_every == 0:
+                print(
+                    f"[Train] step {global_step} | "
+                    f"loss={loss.item():.4f} | "
+                    f"bitwise_acc={bitwise_accuracy.item():.4f} | "
+                    f"l2_w={l2_loss_weight:.3f}"
+                )
+
             if global_step in plot_points:
                 writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
                 writer.add_scalar("loss", loss.item(), global_step)
@@ -433,6 +454,14 @@ def main():
                 torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_decoder.pth"))
                 with open(join(CHECKPOINTS_PATH, f"{EXP_NAME}_variables.txt"), "w") as f:
                     f.write(str(global_step))
+                    
+        # ---- end-of-epoch summary ----
+        avg_epoch_loss = epoch_loss_sum / max(1, epoch_batches)
+        avg_epoch_bit_acc = epoch_bit_acc_sum / max(1, epoch_batches)
+        print(
+            f"[Train] Finished epoch {i_epoch + 1}/{args.num_epochs} | "
+            f"avg_loss={avg_epoch_loss:.4f} | "
+            f"avg_bitwise_acc={avg_epoch_bit_acc:.4f}"
 
     # ----- final save so _last always updates -----
     torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_optim_last.pth"))
