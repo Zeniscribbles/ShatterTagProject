@@ -124,6 +124,15 @@ parser.add_argument("--use_cifar10", action="store_true",
 parser.add_argument("--cifar10_root", type=str, default="./_data",
                     help="Where to download/store CIFAR-10 when --use_cifar10 is set.")
 
+# --- Cifar10 Subset argparse additions ---
+parser.add_argument("--subset_size", type=int, default=0,
+                    help="If >0, sample this many training images from CIFAR-10.")
+parser.add_argument("--subset_seed", type=int, default=1337,
+                    help="RNG seed for subset sampling.")
+parser.add_argument("--val_split", type=float, default=0.05,
+                    help="Optional fraction of the (sub)set for validation.")
+
+
 
 args = parser.parse_args()
 
@@ -233,34 +242,50 @@ def load_data():
     IMAGE_CHANNELS = 3
     SECRET_SIZE = args.bit_length
 
+   # --- transforms ---
     if args.use_celeba_preprocessing:
-        assert args.image_resolution == 128, f"CelebA preprocessing requires image resolution 128, got {args.image_resolution}."
-        transform = transforms.Compose(
-            [
-                transforms.CenterCrop(148),
-                transforms.Resize(128),
-                transforms.ToTensor(),
-            ]
+        assert args.image_resolution == 128, (
+            f"CelebA preprocessing requires 128x128, got {args.image_resolution}."
         )
+        transform = transforms.Compose([
+            transforms.CenterCrop(148),
+            transforms.Resize(128),
+            transforms.ToTensor(),
+        ])
     else:
-        transform = transforms.Compose(
-            [
-                transforms.Resize(IMAGE_RESOLUTION),
-                transforms.CenterCrop(IMAGE_RESOLUTION),
-                transforms.ToTensor(),
-            ]
-        )
+        transform = transforms.Compose([
+            transforms.Resize(IMAGE_RESOLUTION),
+            transforms.CenterCrop(IMAGE_RESOLUTION),
+            transforms.ToTensor(),
+        ])
     
-    s = time()
+     s = time()
     if args.use_cifar10:
         print(f"Loading CIFAR-10 (root={args.cifar10_root}) ...")
-        dataset = CIFAR10(root=args.cifar10_root, train=True, download=True, transform=transform)
+        full_dataset = CIFAR10(
+            root=args.cifar10_root,
+            train=True,
+            download=True,  # only downloads if missing
+            transform=transform,
+        )
+
+        # --- subset logic ---
+        subset_size = getattr(args, "subset_size", 0)
+        subset_seed = getattr(args, "subset_seed", 1337)
+        if subset_size and subset_size > 0:
+            print(f"Sampling {subset_size} images from CIFAR-10 (seed={subset_seed})")
+            g = torch.Generator().manual_seed(subset_seed)
+            perm = torch.randperm(len(full_dataset), generator=g)[:subset_size]
+            dataset = torch.utils.data.Subset(full_dataset, perm.tolist())
+        else:
+            dataset = full_dataset
+
     else:
         print(f"Loading image folder {args.data_dir} ...")
         dataset = CustomImageFolder(args.data_dir, transform=transform)
 
     print(f"Finished. Loading took {time() - s:.2f}s")
-
+    print(f"Dataset size: {len(dataset)} images")
 
 def main():
     now = datetime.now()
