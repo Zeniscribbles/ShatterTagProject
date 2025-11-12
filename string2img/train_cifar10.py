@@ -152,7 +152,7 @@ import PIL
 import torch
 from torch import nn
 from torchvision.datasets import CIFAR10
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.utils import make_grid
 # from torchvision.datasets import ImageFolder
@@ -295,7 +295,39 @@ def main():
     device = parse_device(args.cuda)
     print(f"Using device: {device}")
 
-    load_data()
+    # ------------------------------ NEW: build subset + loader once ------------------------------
+    from torchvision.datasets import CIFAR10
+    from torchvision import transforms
+    from torch.utils.data import DataLoader, Subset
+    import torch
+
+    transform_train = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    # Do NOT redownload if you already have it
+    train_full = CIFAR10(root=args.cifar10_root, train=True, download=False, transform=transform_train)
+
+    if args.subset_size and args.subset_size > 0:
+        g = torch.Generator().manual_seed(args.subset_seed)
+        idx = torch.randperm(len(train_full), generator=g)[:args.subset_size]
+        train_set = Subset(train_full, idx.tolist())
+        print(f"[Data] Using CIFAR-10 subset: {len(train_set)} / {len(train_full)}")
+    else:
+        train_set = train_full
+        print(f"[Data] Using full CIFAR-10 train set: {len(train_set)}")
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        drop_last=True,
+    )
+    # ---------------------------------------------------------------------------------------------
+
     encoder = models.StegaStampEncoder(
         args.image_resolution,
         IMAGE_CHANNELS,
@@ -318,15 +350,14 @@ def main():
     steps_since_l2_loss_activated = -1
 
     for i_epoch in range(args.num_epochs):
-        dataloader = DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=True, num_workers=2
-        )
-        for images, _ in tqdm(dataloader):
+        # NOTE: we iterate over the prebuilt train_loader; do NOT rebuild a new DataLoader here.
+        for images, _ in tqdm(train_loader):
             global_step += 1
 
-            batch_size = min(args.batch_size, images.size(0))
+            # Current batch size (after drop_last) is images.size(0)
+            bsz = images.size(0)
             fingerprints = generate_random_fingerprints(
-                args.bit_length, batch_size, (args.image_resolution, args.image_resolution)
+                args.bit_length, bsz, (args.image_resolution, args.image_resolution)
             )
 
             l2_loss_weight = min(
@@ -358,44 +389,33 @@ def main():
 
             encoder.zero_grad()
             decoder.zero_grad()
-
             loss.backward()
             decoder_encoder_optim.step()
 
             fingerprints_predicted = (decoder_output > 0).float()
-            bitwise_accuracy = 1.0 - torch.mean(
-                torch.abs(fingerprints - fingerprints_predicted)
-            )
+            bitwise_accuracy = 1.0 - torch.mean(torch.abs(fingerprints - fingerprints_predicted))
+
             if steps_since_l2_loss_activated == -1:
                 if bitwise_accuracy.item() > 0.9:
                     steps_since_l2_loss_activated = 0
             else:
                 steps_since_l2_loss_activated += 1
 
-            # Logging
+            # --- your logging / checkpointing block stays the same below ---
             if global_step in plot_points:
-                # writer.add_scalar("bitwise_accuracy", bitwise_accuracy, global_step)
-                writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step) # For TensorBoard
-                print("Bitwise accuracy {}".format(bitwise_accuracy))
-
-                # writer.add_scalar("loss", loss, global_step) # For TensorBoard
+                writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
                 writer.add_scalar("loss", loss.item(), global_step)
-
-                # writer.add_scalar("BCE_loss", BCE_loss, global_step) # For TensorBoard
                 writer.add_scalar("BCE_loss", BCE_loss.item(), global_step)
                 writer.add_scalars(
                     "clean_statistics",
                     {"min": clean_images.min(), "max": clean_images.max()},
                     global_step,
-                ),
+                )
                 writer.add_scalars(
                     "with_fingerprint_statistics",
-                    {
-                        "min": fingerprinted_images.min(),
-                        "max": fingerprinted_images.max(),
-                    },
+                    {"min": fingerprinted_images.min(), "max": fingerprinted_images.max()},
                     global_step,
-                ),
+                )
                 writer.add_scalars(
                     "residual_statistics",
                     {
@@ -404,7 +424,7 @@ def main():
                         "mean_abs": residual.abs().mean(),
                     },
                     global_step,
-                ),
+                )
                 print(
                     "residual_statistics: {}".format(
                         {
@@ -414,74 +434,32 @@ def main():
                         }
                     )
                 )
-                writer.add_image(
-                    "clean_image", make_grid(clean_images, normalize=True), global_step
-                )
-                writer.add_image(
-                    "residual",
-                    make_grid(residual, normalize=True, scale_each=True),
-                    global_step,
-                )
-                writer.add_image(
-                    "image_with_fingerprint",
-                    make_grid(fingerprinted_images, normalize=True),
-                    global_step,
-                )
+                writer.add_image("clean_image", make_grid(clean_images, normalize=True), global_step)
+                writer.add_image("residual", make_grid(residual, normalize=True, scale_each=True), global_step)
+                writer.add_image("image_with_fingerprint", make_grid(fingerprinted_images, normalize=True), global_step)
                 save_image(
                     fingerprinted_images,
                     SAVED_IMAGES + "/{}.png".format(global_step),
                     normalize=True,
                 )
+                writer.add_scalar("loss_weights/l2_loss_weight", l2_loss_weight, global_step)
+                writer.add_scalar("loss_weights/BCE_loss_weight", BCE_loss_weight, global_step)
 
-                writer.add_scalar(
-                    "loss_weights/l2_loss_weight", l2_loss_weight, global_step
-                )
-                writer.add_scalar(
-                    "loss_weights/BCE_loss_weight",
-                    BCE_loss_weight,
-                    global_step,
-                )
-
-            # checkpointing
             if global_step % 5000 == 0:
-                torch.save(
-                    decoder_encoder_optim.state_dict(),
-                    join(CHECKPOINTS_PATH, EXP_NAME + "_optim.pth"),
-                )
-                torch.save(
-                    encoder.state_dict(),
-                    join(CHECKPOINTS_PATH, EXP_NAME + "_encoder.pth"),
-                )
-                torch.save(
-                    decoder.state_dict(),
-                    join(CHECKPOINTS_PATH, EXP_NAME + "_decoder.pth"),
-                )
-                
-                f = open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w")
-                f.write(str(global_step))
-                f.close()
-    
+                torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_optim.pth"))
+                torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_encoder.pth"))
+                torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_decoder.pth"))
+                with open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w") as f:
+                    f.write(str(global_step))
+
     # ----- final save so _last always updates -----
-    torch.save(
-        decoder_encoder_optim.state_dict(),
-        join(CHECKPOINTS_PATH, EXP_NAME + "_optim_last.pth"),
-    )
-    torch.save(
-        encoder.state_dict(),
-        join(CHECKPOINTS_PATH, EXP_NAME + "_encoder_last.pth"),
-    )
-    torch.save(
-        decoder.state_dict(),
-        join(CHECKPOINTS_PATH, EXP_NAME + "_decoder_last.pth"),
-    )
+    torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_optim_last.pth"))
+    torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_encoder_last.pth"))
+    torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, EXP_NAME + "_decoder_last.pth"))
     with open(join(CHECKPOINTS_PATH, EXP_NAME + "_variables.txt"), "w") as f:
         f.write(str(global_step))
-# ---------------------------------------------
 
-
-    # writer.export_scalars_to_json("./all_scalars.json")
     writer.close()
-
 
 if __name__ == "__main__":
     main()
