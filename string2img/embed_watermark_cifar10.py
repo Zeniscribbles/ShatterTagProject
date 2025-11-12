@@ -36,8 +36,8 @@ parser.add_argument("--use_celeba_preprocessing", action="store_true",
 parser.add_argument("--encoder_path", type=str, required=True,
     help="Path (or glob) to StegaStamp encoder .pth.")
 
-#parser.add_argument("--data_dir", type=str, required=True,
-#    help="Directory with images (non-recursive by default).")
+parser.add_argument("--data_dir", type=str, required=True,
+    help="Directory with images (non-recursive by default).")
 
 parser.add_argument("--output_dir", type=str, required=True,
     help="Directory to save watermarked images.")
