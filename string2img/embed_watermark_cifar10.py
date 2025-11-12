@@ -1,48 +1,13 @@
 """
 Embed fingerprints into images using a trained StegaStamp encoder.
 
-Keeps original logic:
-- optional CelebA preprocessing
-- identical vs. random per-image fingerprints
-- optional on-the-fly check via decoder
-- same function structure: load_data -> load_models -> embed_fingerprints
-
-Colab hardening (only what this file actually does):
-- creates output dirs up front
-- robust device parsing (CPU / CUDA / CUDA:N); models set to eval()
-- RGB-safe image loading (PIL .convert('RGB'))
-- checkpoints loaded on CPU, then moved to the selected device
+- Flat-folder OR CIFAR-10 loading (toggle with --use_cifar10)
+- Optional CelebA preprocessing
+- Identical vs. random per-image fingerprints
+- Optional on-the-fly check via decoder
 
 Typical use
------------
-python embed_watermark_cifar10.py \
-  --encoder_path "/path/to/*_encoder_last.pth" \
-  --data_dir "/path/to/images" \
-  --output_dir "/path/to/embedded" \
-  --output_dir_note "/path/to/notes" \
-  --image_resolution 32 \
-  --batch_size 64 \
-  --seed 42 \
-  --identical_fingerprints \
-  --check --decoder_path "/path/to/*_decoder_last.pth"
 
-  Running with Identical Fingerprints for Detection:
-  --------------------------------------------------
-  python /content/drive/MyDrive/ShatterTagProject/string2img/embed_watermark_cifar10.py \
-  --encoder_path "/content/drive/MyDrive/ShatterTagProject/output/cifar10_run1/checkpoints/*_encoder_last.pth" \
-  --decoder_path "/content/drive/MyDrive/ShatterTagProject/output/cifar10_run1/checkpoints/*_decoder_last.pth" \
-  --data_dir "/content/drive/MyDrive/ShatterTagProject/data/cifar10" \
-  --output_dir "/content/drive/MyDrive/ShatterTagProject/output/cifar10_run1/embedded_ident" \
-  --output_dir_note "/content/drive/MyDrive/ShatterTagProject/output/cifar10_run1/notes_ident" \
-  --image_resolution 32 \
-  --batch_size 64 \
-  --seed 42 \
-  --identical_fingerprints \
-  --check
-
-    Then open: /content/drive/MyDrive/ShatterTagProject/output/cifar10_run1/notes_ident/embedded_fingerprints.txt
-    Copy the single bitstring in there and pass it to the detector 
-    (the fixed-bitstring) via its --ground_truth_fp (or equivalent) flag.
 
 Author: Amanda + Chansen
 Citation: https://github.com/yunqing-me/WatermarkDM.git
@@ -59,6 +24,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.utils import save_image
+from torchvision.datasets import CIFAR10
 
 # -----------------------------
 # Args
@@ -66,31 +32,52 @@ from torchvision.utils import save_image
 parser = argparse.ArgumentParser()
 parser.add_argument("--use_celeba_preprocessing", action="store_true",
     help="Use CelebA-specific preprocessing (requires --image_resolution 128).")
+
 parser.add_argument("--encoder_path", type=str, required=True,
     help="Path (or glob) to StegaStamp encoder .pth.")
+
 parser.add_argument("--data_dir", type=str, required=True,
     help="Directory with images (non-recursive by default).")
+
 parser.add_argument("--output_dir", type=str, required=True,
     help="Directory to save watermarked images.")
+
 parser.add_argument("--output_dir_note", type=str, required=True,
     help="Directory to save fingerprint metadata (embedded_fingerprints.txt).")
+
 parser.add_argument("--image_resolution", type=int, required=True,
     help="Height and width of square images.")
+
 parser.add_argument("--identical_fingerprints", action="store_true",
     help="If set, use identical fingerprints per batch; else random per image.")
+
 parser.add_argument("--check", action="store_true",
     help="Validate fingerprint detection accuracy with a decoder.")
+
 parser.add_argument("--decoder_path", type=str, default=None,
     help="Path (or glob) to StegaStamp decoder .pth (required if --check).")
+
 parser.add_argument("--batch_size", type=int, default=64, help="Batch size.")
+
 parser.add_argument("--seed", type=int, default=42, help="Random seed for fingerprints.")
+
 parser.add_argument("--cuda", type=str, default="cuda",
     help="Device: -1 or 'cpu', 'cuda', 'cuda:N', or an int index.")
+
 parser.add_argument("--num_workers", type=int, default=None,
     help="DataLoader workers (auto: 2 on CUDA, 0 on CPU).")
+
+# Cifar10 Dataset Arguments
+parser.add_argument("--use_cifar10", action="store_true",
+                    help="Load images from torchvision.datasets.CIFAR10 instead of --data_dir.")
+
+parser.add_argument("--cifar10_root", type=str, default="./_data",
+                    help="Root to the CIFAR-10 cache (used with --use_cifar10).")
+
 # Opt-in: keep default non-recursive, lowercase-only to match your original logic.
 parser.add_argument("--recursive", action="store_true",
     help="If set, recurse into subdirectories and accept upper-case extensions.")
+
 args = parser.parse_args()
 BATCH_SIZE = args.batch_size
 
