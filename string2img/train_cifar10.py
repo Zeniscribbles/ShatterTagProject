@@ -553,7 +553,21 @@ def main():
         else:
             tamper_bit_acc_vs_bad = torch.tensor(0.0, device=device)
 
-            # Stay as-is
+
+        # -----------------------------------------
+        # TensorBoard logging for fragility stuff
+        # -----------------------------------------
+        writer.add_scalar("train/BCE_loss_tam", BCE_loss_tam.item(), global_step)
+
+        writer.add_scalars(
+            "train/tamper_bitwise_acc",
+            {
+                "vs_true": tamper_bit_acc_vs_true.item(),
+                "vs_bad": tamper_bit_acc_vs_bad.item(),
+            },
+            global_step,
+        )
+            # Legacy Code: Stay as-is
             if steps_since_l2_loss_activated == -1:
                 if bitwise_accuracy.item() > 0.9:
                     steps_since_l2_loss_activated = 0
