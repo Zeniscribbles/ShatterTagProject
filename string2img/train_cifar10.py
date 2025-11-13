@@ -61,6 +61,7 @@ import os
 from os.path import join
 from datetime import datetime
 import time  # For time.time()
+import random
 
 import glob
 import PIL
@@ -70,6 +71,8 @@ from tqdm import tqdm
 import torch
 from torch import nn
 from torch.optim import Adam
+import torch.nn.functional as F
+import torchvision.transforms.functional as
 from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10
@@ -81,6 +84,74 @@ from torchvision.utils import make_grid, save_image
 from torch.utils.tensorboard import SummaryWriter # For google colab
 
 import models
+
+
+# -----------------------------
+# Perturbation bank
+# -----------------------------
+ """
+    x: (N, C, H, W), values in [0,1]
+    strength in [0, 1]-ish
+    Returns tampered image, no clipping of grad assumed here (caller can no_grad).
+    """
+def perturbation_bank(x, strength: float = 1.0):
+    # We’ll build a few small, CIFAR-friendly ops and chain 1–3 of them.
+    def jpeg_like(img):
+        # fake JPEG via down-up-sample
+        N, C, H, W = img.shape
+        scale = 1.0 - 0.02 * strength  # shrink by up to ~2%
+        scale = max(0.5, scale)
+        newH = max(2, int(H * scale))
+        newW = max(2, int(W * scale))
+        img2 = F.interpolate(img, size=(newH, newW), mode="bilinear", align_corners=False)
+        img3 = F.interpolate(img2, size=(H, W), mode="bilinear", align_corners=False)
+        return img3.clamp(0, 1)
+
+    def gauss_noise(img):
+        sigma = (0.5 / 255.0) * strength
+        return (img + sigma * torch.randn_like(img)).clamp(0, 1)
+
+    def blur(img):
+        k = 3 if strength < 0.6 else 5
+        return TF.gaussian_blur(img, kernel_size=k, sigma=0.5 + 0.5 * strength)
+
+    def brightness(img):
+        delta = 0.01 * strength
+        factor = 1.0 + random.choice([-delta, delta])
+        return TF.adjust_brightness(img, factor)
+
+    def tiny_crop(img):
+        N, C, H, W = img.shape
+        pad = max(1, int(0.02 * H * strength))  # tiny crop
+        top = random.randint(0, pad)
+        left = random.randint(0, pad)
+        newH = H - random.randint(0, pad)
+        newW = W - random.randint(0, pad)
+        newH = max(2, newH)
+        newW = max(2, newW)
+        cropped = img[..., top:newH, left:newW]
+        return F.interpolate(cropped, size=(H, W), mode="bilinear", align_corners=False).clamp(0, 1)
+
+    def subpixel_shift(img):
+        N, C, H, W = img.shape
+        dx = 0.5 * strength * random.choice([-1, 1])
+        dy = 0.5 * strength * random.choice([-1, 1])
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=img.device),
+            torch.linspace(-1, 1, W, device=img.device),
+            indexing="ij",
+        )
+        grid = torch.stack((grid_x + dx / W, grid_y + dy / H), dim=-1)
+        grid = grid.unsqueeze(0).expand(N, H, W, 2)
+        return F.grid_sample(img, grid, align_corners=True)
+
+    ops = [jpeg_like, gauss_noise, blur, brightness, tiny_crop, subpixel_shift]
+
+    k = random.randint(1, 3)
+    out = x
+    for f in random.sample(ops, k=k):
+        out = f(out)
+    return out
 
 
 # -----------------------------
@@ -174,7 +245,7 @@ parser.add_argument("--tamper_mode", type=str, default="wrong-string",
 
 parser.add_argument("--w_bad", type=str, default="zeros",
                     help="Wrong-string mode: 'zeros', 'ones' (for now)")
-                    
+
 parser.add_argument("--aug_strength", type=float, default=1.0,
                     help="Scales all perturbation magnitudes in bank 𝒜")
 
