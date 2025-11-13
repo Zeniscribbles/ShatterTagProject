@@ -95,7 +95,7 @@ import models
     Returns tampered image, no clipping of grad assumed here (caller can no_grad).
     """
 def perturbation_bank(x, strength: float = 1.0):
-    # We’ll build a few small, CIFAR-friendly ops and chain 1–3 of them.
+    # build a few small, CIFAR-friendly ops and chain 1–3 of them.
     def jpeg_like(img):
         # fake JPEG via down-up-sample
         N, C, H, W = img.shape
@@ -461,39 +461,99 @@ def main():
         epoch_bit_acc_sum = 0.0
         epoch_batches = 0
 
+        # Starting fragility training
         for images, _ in tqdm(train_loader):
-            global_step += 1
+                    bsz = images.size(0)
+        fingerprints = generate_random_fingerprints(
+            args.bit_length,
+            bsz,
+            (args.image_resolution, args.image_resolution),
+        )
 
-            bsz = images.size(0)
-            fingerprints = generate_random_fingerprints(args.bit_length, bsz, (args.image_resolution, args.image_resolution))
+        # l2 schedule stays exactly as before
+        l2_loss_weight = min(
+            max(0, args.l2_loss_weight * (steps_since_l2_loss_activated - args.l2_loss_await) / args.l2_loss_ramp),
+            args.l2_loss_weight,
+        )
+        BCE_loss_weight = args.BCE_loss_weight
 
-            l2_loss_weight = min(
-                max(0, args.l2_loss_weight * (steps_since_l2_loss_activated - args.l2_loss_await) / args.l2_loss_ramp),
-                args.l2_loss_weight,
+        clean_images = images.to(device)
+        fingerprints = fingerprints.to(device)
+
+        # ----- encoder: clean path -----
+        fingerprinted_images = encoder(fingerprints, clean_images)
+        residual = fingerprinted_images - clean_images
+
+        # clean decode
+        decoder_output_clean = decoder(fingerprinted_images)
+
+        # clean losses
+        l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
+        BCE_loss_clean = nn.BCEWithLogitsLoss()(
+            decoder_output_clean.view(-1),
+            fingerprints.view(-1),
+        )
+
+        # ----- tamper path: attack only the encoded image -----
+        with torch.no_grad():
+            tampered_images = perturbation_bank(
+                fingerprinted_images,
+                strength=args.aug_strength,
             )
-            BCE_loss_weight = args.BCE_loss_weight
 
-            clean_images = images.to(device)
-            fingerprints = fingerprints.to(device)
+        decoder_output_tam = decoder(tampered_images)
 
-            fingerprinted_images = encoder(fingerprints, clean_images)
-            residual = fingerprinted_images - clean_images
+        # define tamper target and tamper loss
+        if args.tamper_mode == "wrong-string":
+            if args.w_bad.lower() == "zeros":
+                w_bad = torch.zeros_like(fingerprints)
+            elif args.w_bad.lower() == "ones":
+                w_bad = torch.ones_like(fingerprints)
+            else:
+                # default to zeros if unknown
+                w_bad = torch.zeros_like(fingerprints)
 
-            decoder_output = decoder(fingerprinted_images)
+            BCE_loss_tam = nn.BCEWithLogitsLoss()(
+                decoder_output_tam.view(-1),
+                w_bad.view(-1),
+            )
 
-            l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
-            BCE_loss = nn.BCEWithLogitsLoss()(decoder_output.view(-1), fingerprints.view(-1))
+        elif args.tamper_mode == "entropy-max":
+            probs_tam = torch.sigmoid(decoder_output_tam)
+            target = 0.5 * torch.ones_like(probs_tam)
+            BCE_loss_tam = nn.BCELoss()(
+                probs_tam.view(-1),
+                target.view(-1),
+            )
+        else:
+            # safety fallback
+            BCE_loss_tam = torch.tensor(0.0, device=device)
 
-            loss = l2_loss_weight * l2_loss + BCE_loss_weight * BCE_loss
+        # ----- total loss: clean + fidelity - beta * tamper -----
+        loss = (
+            l2_loss_weight * l2_loss
+            + BCE_loss_weight * BCE_loss_clean
+            - args.beta * BCE_loss_tam
+        )
 
-            encoder.zero_grad(set_to_none=True)
-            decoder.zero_grad(set_to_none=True)
-            loss.backward()
-            decoder_encoder_optim.step()
+        encoder.zero_grad(set_to_none=True)
+        decoder.zero_grad(set_to_none=True)
+        loss.backward()
+        decoder_encoder_optim.step()
 
-            fingerprints_predicted = (decoder_output > 0).float()
-            bitwise_accuracy = 1.0 - torch.mean(torch.abs(fingerprints - fingerprints_predicted))
+        # ----- clean bitwise accuracy (used for l2 schedule + logging) -----
+        fingerprints_predicted = (decoder_output_clean > 0).float()
+        bitwise_accuracy = 1.0 - torch.mean(torch.abs(fingerprints - fingerprints_predicted))
 
+        # optional: tamper metrics (if you want to log them later)
+        tamper_pred = (decoder_output_tam > 0).float()
+        tamper_bit_acc_vs_true = 1.0 - torch.mean(torch.abs(fingerprints - tamper_pred))
+        if args.tamper_mode == "wrong-string":
+            tamper_bit_acc_vs_bad = 1.0 - torch.mean(torch.abs(w_bad - tamper_pred))
+        else:
+            tamper_bit_acc_vs_bad = torch.tensor(0.0, device=device)
+
+            # Stay as-is
             if steps_since_l2_loss_activated == -1:
                 if bitwise_accuracy.item() > 0.9:
                     steps_since_l2_loss_activated = 0
