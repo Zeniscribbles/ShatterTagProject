@@ -164,6 +164,19 @@ parser.add_argument("--subset_seed", type=int, default=1337,
 
 args = parser.parse_args()
 
+# ----------- For Fragility --------------------
+parser.add_argument("--beta", type=float, default=1.0,
+                    help="Weight for anti-robustness (fragility) term")
+
+parser.add_argument("--tamper_mode", type=str, default="wrong-string",
+                    choices=["wrong-string", "entropy-max"],
+                    help="How to define failure target on tampered inputs")
+
+parser.add_argument("--w_bad", type=str, default="zeros",
+                    help="Wrong-string mode: 'zeros', 'ones' (for now)")
+                    
+parser.add_argument("--aug_strength", type=float, default=1.0,
+                    help="Scales all perturbation magnitudes in bank 𝒜")
 
 # -----------------------------
 # Paths (create BEFORE SummaryWriter)
