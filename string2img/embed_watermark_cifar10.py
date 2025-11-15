@@ -97,11 +97,11 @@ parser.add_argument("--use_cifar10", action="store_true",
 parser.add_argument("--cifar10_root", type=str, default="./_data",
                     help="Root to the CIFAR-10 cache (used with --use_cifar10).")
 
-# Cifar10 subset to match training subset
-parser.add_argument(
-    "--cifar10_limit", type=int, default=None,
-    help="If set with --use_cifar10, only use the first N images from the CIFAR-10 train split.",
-)
+# Cifar10 subset (mirror train_cifar10.py)
+parser.add_argument("--subset_size", type=int, default=0,
+                    help="If >0, sample this many training images from CIFAR-10.")
+parser.add_argument("--subset_seed", type=int, default=1337,
+                    help="RNG seed for CIFAR-10 subset sampling.")
 
 
 # Opt-in: keep default non-recursive, lowercase-only to match your original logic.
