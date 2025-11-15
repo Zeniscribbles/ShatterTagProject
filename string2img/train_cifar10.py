@@ -464,8 +464,10 @@ def main():
 
         # Starting fragility training
         for images, _ in tqdm(train_loader):
-            bsz = images.size(0)
             
+            global_step += 1
+
+            bsz = images.size(0)
             fingerprints = generate_random_fingerprints(
                 args.bit_length,
                 bsz,
@@ -584,12 +586,17 @@ def main():
         # ---- occasional console logging ----
         if global_step % log_every == 0:
             print(
-                f"[Train] step {global_step} | "
-                f"loss={loss.item():.4f} | "
-                f"bitwise_acc={bitwise_accuracy.item():.4f} | "
-                f"l2_w={l2_loss_weight:.3f}"
-            )
+                    f"[Train] step {global_step} | "
+                    f"loss={loss.item():.4f} | "
+                    f"clean_BCE={BCE_loss_clean.item():.4f} | "
+                    f"tam_BCE={BCE_loss_tam.item():.4f} | "
+                    f"bitwise_acc={bitwise_accuracy.item():.4f} | "
+                    f"tamper_vs_true={tamper_bit_acc_vs_true.item():.4f} | "
+                    f"tamper_vs_bad={tamper_bit_acc_vs_bad.item():.4f} | "
+                    f"l2_w={l2_loss_weight:.3f}"
+                )
 
+        # Optional: old image/stat logging
         if global_step in plot_points:
             writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
             writer.add_scalar("loss", loss.item(), global_step)
