@@ -628,13 +628,13 @@ def main():
                     f.write(str(global_step))
             '''
 
-        # ---- end-of-epoch summary ----
-        avg_epoch_loss = epoch_loss_sum / max(1, epoch_batches)
-        avg_epoch_bit_acc = epoch_bit_acc_sum / max(1, epoch_batches)
-        print(
-            f"[Train] Finished epoch {i_epoch + 1}/{args.num_epochs} | "
-            f"avg_loss={avg_epoch_loss:.4f} | "
-            f"avg_bitwise_acc={avg_epoch_bit_acc:.4f}")
+            # ---- end-of-epoch summary ----
+            avg_epoch_loss = epoch_loss_sum / max(1, epoch_batches)
+            avg_epoch_bit_acc = epoch_bit_acc_sum / max(1, epoch_batches)
+            print(
+                f"[Train] Finished epoch {i_epoch + 1}/{args.num_epochs} | "
+                f"avg_loss={avg_epoch_loss:.4f} | "
+                f"avg_bitwise_acc={avg_epoch_bit_acc:.4f}")
 
     # ----- final save so _last always updates -----
     torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_optim_last.pth"))
