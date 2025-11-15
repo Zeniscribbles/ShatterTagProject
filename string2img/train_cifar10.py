@@ -1,57 +1,24 @@
 """
 train_cifar10.py — StegaStamp training
 
-Overview
---------
-Trains a StegaStamp-style encoder/decoder to embed and recover binary fingerprints from RGB images.
-This version stays faithful to the original training flow (same losses, scheduling, logging,
-and checkpointing). The only change is how the dataset is loaded so it works cleanly with
-a Google Colab–exported CIFAR-10 folder.
-
-What changed for Colab CIFAR-10 import
---------------------------------------
-- Flat-folder loader: instead of class subdirs or shard loops, the script reads a single
-  flat directory of images produced by your Colab export:
-    /.../data/cifar10/00000.png … 49999.png
-- No recursion, no labels required; we just glob .png/.jpg/.jpeg in that folder.
-- Everything else (model defs, optimizer, losses, bitwise accuracy metric, TensorBoard
-  logging, and checkpoint cadence) is unchanged.
-
-Typical use
------------
-python train_cifar10.py \
-  --data_dir "/content/drive/MyDrive/ShatterTagProject/data/cifar10" \
-  --output_dir "/content/drive/MyDrive/ShatterTagProject/output/cifar10_run1" \
+Typical Use:
+------------
+!python /content/drive/MyDrive/ShatterTagProject/string2img/train_cifar10.py \
+  --use_cifar10 \
+  --cifar10_root "/content/drive/MyDrive/ShatterTagProject/_datasets/cifar10_torch" \
+  --output_dir "/content/drive/MyDrive/ShatterTagProject/output/cifar10_10k" \
+  --subset_size 10000 \
+  --subset_seed 1337 \
   --image_resolution 32 \
   --bit_length 64 \
   --batch_size 64 \
-  --num_epochs 10 \
+  --num_epochs 40 \
   --lr 1e-4 \
   --cuda cuda \
+  --beta 0.0 \
   --l2_loss_weight 1.0 \
-  --l2_loss_await 0 \
   --l2_loss_ramp 1000 \
-  --BCE_loss_weight 1.0 
-
-Inputs
-------
---data_dir: path to the flat CIFAR-10 export folder (images only, no subfolders)
---output_dir: base directory for logs / checkpoints / saved images
---image_resolution: square size to which images are resized/cropped
---bit_length: number of bits in the embedded fingerprint
-(plus the usual optimizer, loss-weight, and logging args)
-
-Outputs
--------
-- TensorBoard logs: <output_dir>/logs
-- Checkpoints:      <output_dir>/checkpoints
-- Sample images:    <output_dir>/saved_images
-
-Assumptions
------------
-- The Colab export produced RGB images with lowercase extensions (.png/.jpg/.jpeg).
-- The folder is flat (no class subdirectories).
-- image_resolution matches the training/eval pipeline (e.g., 32 for CIFAR-10).
+  --BCE_loss_weight 1.0
 
 Author: Amanda + Chansen
 Citation: https://github.com/yunqing-me/WatermarkDM.git
@@ -169,13 +136,6 @@ parser.add_argument("--subset_seed", type=int, default=1337,
 # ----------- For Fragility --------------------
 parser.add_argument("--beta", type=float, default=1.0,
                     help="Weight for anti-robustness (fragility) term")
-
-parser.add_argument("--tamper_mode", type=str, default="wrong-string",
-                    choices=["wrong-string", "entropy-max"],
-                    help="How to define failure target on tampered inputs")
-
-parser.add_argument("--w_bad", type=str, default="zeros",
-                    help="Wrong-string mode: 'zeros', 'ones' (for now)")
 
 parser.add_argument("--aug_strength", type=float, default=1.0,
                     help="Scales all perturbation magnitudes in bank 𝒜")
@@ -319,59 +279,6 @@ class CustomImageFolder(Dataset):
         return len(self.filenames)
 
 
-def load_data():
-    global dataset, dataloader
-    global IMAGE_CHANNELS, IMAGE_HEIGHT, IMAGE_WIDTH, SECRET_SIZE
-
-    IMAGE_RESOLUTION = args.image_resolution
-    IMAGE_CHANNELS = 3
-    SECRET_SIZE = args.bit_length
-
-   # --- transforms ---
-    if args.use_celeba_preprocessing:
-        assert args.image_resolution == 128, (
-            f"CelebA preprocessing requires 128x128, got {args.image_resolution}."
-        )
-        transform = transforms.Compose([
-            transforms.CenterCrop(148),
-            transforms.Resize(128),
-            transforms.ToTensor(),
-        ])
-    else:
-        transform = transforms.Compose([
-            transforms.Resize(IMAGE_RESOLUTION),
-            transforms.CenterCrop(IMAGE_RESOLUTION),
-            transforms.ToTensor(),
-        ])
-    
-    s = time()
-    if args.use_cifar10:
-        print(f"Loading CIFAR-10 (root={args.cifar10_root}) ...")
-        full_dataset = CIFAR10(
-            root=args.cifar10_root,
-            train=True,
-            download=True,  # only downloads if missing
-            transform=transform,
-        )
-
-        # --- subset logic ---
-        subset_size = getattr(args, "subset_size", 0)
-        subset_seed = getattr(args, "subset_seed", 1337)
-        if subset_size and subset_size > 0:
-            print(f"Sampling {subset_size} images from CIFAR-10 (seed={subset_seed})")
-            g = torch.Generator().manual_seed(subset_seed)
-            perm = torch.randperm(len(full_dataset), generator=g)[:subset_size]
-            dataset = torch.utils.data.Subset(full_dataset, perm.tolist())
-        else:
-            dataset = full_dataset
-
-    else:
-        print(f"Loading image folder {args.data_dir} ...")
-        dataset = CustomImageFolder(args.data_dir, transform=transform)
-
-    print(f"Finished. Loading took {time() - s:.2f}s")
-    print(f"Dataset size: {len(dataset)} images")
-
 # -----------------------------
 # Main
 # -----------------------------
@@ -401,26 +308,26 @@ def main():
         ])
 
     # Dataset (CIFAR-10 recommended)
-        if args.use_cifar10:
-            print(f"Loading CIFAR-10 (root={args.cifar10_root}) ...")
-            # download=True won't re-download if already cached
-            train_full = CIFAR10(root=args.cifar10_root, train=True, download=True,
-                                transform=(transforms.ToTensor() if args.image_resolution == 32 else transform_train))
-            if args.subset_size and args.subset_size > 0:
-                print(f"Sampling {args.subset_size} images from CIFAR-10 (seed={args.subset_seed})")
-                g = torch.Generator().manual_seed(args.subset_seed)
-                idx = torch.randperm(len(train_full), generator=g)[:args.subset_size]
-                train_set = Subset(train_full, idx.tolist())
-                print(f"[Data] Using CIFAR-10 subset: {len(train_set)} / {len(train_full)}")
-            else:
-                train_set = train_full
-                print(f"[Data] Using full CIFAR-10 train set: {len(train_set)}")
+    if args.use_cifar10:
+        print(f"Loading CIFAR-10 (root={args.cifar10_root}) ...")
+        # download=True won't re-download if already cached
+        train_full = CIFAR10(root=args.cifar10_root, train=True, download=True,
+                            transform=(transforms.ToTensor() if args.image_resolution == 32 else transform_train))
+        if args.subset_size and args.subset_size > 0:
+            print(f"Sampling {args.subset_size} images from CIFAR-10 (seed={args.subset_seed})")
+            g = torch.Generator().manual_seed(args.subset_seed)
+            idx = torch.randperm(len(train_full), generator=g)[:args.subset_size]
+            train_set = Subset(train_full, idx.tolist())
+            print(f"[Data] Using CIFAR-10 subset: {len(train_set)} / {len(train_full)}")
         else:
-            if not args.data_dir:
-                raise ValueError("--data_dir must be set when --use_cifar10 is not provided.")
-            print(f"Loading image folder {args.data_dir} ...")
-            train_set = CustomImageFolder(args.data_dir, transform=transform_train)
-            print(f"[Data] Using flat-folder dataset: {len(train_set)} images")
+            train_set = train_full
+            print(f"[Data] Using full CIFAR-10 train set: {len(train_set)}")
+    else:
+        if not args.data_dir:
+            raise ValueError("--data_dir must be set when --use_cifar10 is not provided.")
+        print(f"Loading image folder {args.data_dir} ...")
+        train_set = CustomImageFolder(args.data_dir, transform=transform_train)
+        print(f"[Data] Using flat-folder dataset: {len(train_set)} images")
 
     train_loader = DataLoader(
         train_set,
@@ -447,14 +354,24 @@ def main():
     encoder = encoder.to(device)
     decoder = decoder.to(device)
 
-    decoder_encoder_optim = Adam(params=list(decoder.parameters()) + list(encoder.parameters()), lr=args.lr)
+    #-------------IMPORTANT: PyTorch Shit------------
+    #In PyTorch, every module (nn.Module) has two internal modes:
+    # train mode → model.train()
+    # eval mode → model.eval()
+    #They control layers that behave differently depending on mode
+    #Turn on when running real training and out of debugging modes.
+    #encoder.train()
+    #decoder.train()
 
+    decoder_encoder_optim = Adam(params=list(decoder.parameters()) + list(encoder.parameters()), lr=args.lr)
     torch.backends.cudnn.benchmark = True
 
     global_step = 0
     steps_since_l2_loss_activated = -1
     log_every = 1 # 1 for debugging, O.W. 100
-    
+    bce_logits = nn.BCEWithLogitsLoss()
+    mse_loss = nn.MSELoss()
+
     for i_epoch in range(args.num_epochs):
         print(f"\n[Train] Starting epoch {i_epoch + 1}/{args.num_epochs}")
         
@@ -486,14 +403,14 @@ def main():
 
             # ----- encoder: clean path -----
             fingerprinted_images = encoder(fingerprints, clean_images)
-            residual = fingerprinted_images - clean_images
+            # residual = fingerprinted_images - clean_images logging/visualization
 
             # clean decode
             decoder_output_clean = decoder(fingerprinted_images)
 
             # clean losses
-            l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
-            BCE_loss_clean = nn.BCEWithLogitsLoss()(
+            l2_loss = mse_loss(fingerprinted_images, clean_images)
+            BCE_loss_clean = bce_logits(
                 decoder_output_clean.view(-1),
                 fingerprints.view(-1),
             )
@@ -507,31 +424,10 @@ def main():
 
             decoder_output_tam = decoder(tampered_images)
 
-            # define tamper target and tamper loss
-            if args.tamper_mode == "wrong-string":
-                if args.w_bad.lower() == "zeros":
-                    w_bad = torch.zeros_like(fingerprints)
-                elif args.w_bad.lower() == "ones":
-                    w_bad = torch.ones_like(fingerprints)
-                else:
-                    # default to zeros if unknown
-                    w_bad = torch.zeros_like(fingerprints)
-
-                BCE_loss_tam = nn.BCEWithLogitsLoss()(
-                    decoder_output_tam.view(-1),
-                    w_bad.view(-1),
-                )
-
-            elif args.tamper_mode == "entropy-max":
-                probs_tam = torch.sigmoid(decoder_output_tam)
-                target = 0.5 * torch.ones_like(probs_tam)
-                BCE_loss_tam = nn.BCELoss()(
-                    probs_tam.view(-1),
-                    target.view(-1),
-                )
-            else:
-                # safety fallback
-                BCE_loss_tam = torch.tensor(0.0, device=device)
+            BCE_loss_tam = bce_logits(
+                decoder_output_tam.view(-1),
+                fingerprints.view(-1),   # target = TRUE watermark bits
+            )
 
             # ----- total loss: clean + fidelity - beta * tamper -----
             loss = (
@@ -552,12 +448,7 @@ def main():
             # optional: tamper metrics (if you want to log them later)
             tamper_pred = (decoder_output_tam > 0).float()
             tamper_bit_acc_vs_true = 1.0 - torch.mean(torch.abs(fingerprints - tamper_pred))
-            if args.tamper_mode == "wrong-string":
-                tamper_bit_acc_vs_bad = 1.0 - torch.mean(torch.abs(w_bad - tamper_pred))
-            else:
-                tamper_bit_acc_vs_bad = torch.tensor(0.0, device=device)
-
-
+           
             # -----------------------------------------
             # TensorBoard logging for fragility stuff
             # -----------------------------------------
@@ -567,7 +458,6 @@ def main():
                 "train/tamper_bitwise_acc",
                 {
                     "vs_true": tamper_bit_acc_vs_true.item(),
-                    "vs_bad": tamper_bit_acc_vs_bad.item(),
                 },
                 global_step,
             )
@@ -592,16 +482,15 @@ def main():
                         f"tam_BCE={BCE_loss_tam.item():.4f} | "
                         f"bitwise_acc={bitwise_accuracy.item():.4f} | "
                         f"tamper_vs_true={tamper_bit_acc_vs_true.item():.4f} | "
-                        f"tamper_vs_bad={tamper_bit_acc_vs_bad.item():.4f} | "
                         f"l2_w={l2_loss_weight:.3f}"
                     )
                 
             '''
             # -------------------------------------------------
-                # Legacy image/stat logging & checkpoints 
-                #   - kept here but COMMENTED OUT
-                #   - uncomment if you want full TensorBoard visuals
-                # -------------------------------------------------
+            # Legacy image/stat logging & checkpoints 
+            #   - kept here but COMMENTED OUT
+            #   - uncomment if you want full TensorBoard visuals
+            # -------------------------------------------------
             if global_step in plot_points:
                 writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
                 writer.add_scalar("loss", loss.item(), global_step)
