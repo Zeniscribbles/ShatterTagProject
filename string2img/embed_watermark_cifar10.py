@@ -20,14 +20,16 @@ Typical use:
   --image_resolution 32 \
   --batch_size 64
 
-!python \path\to\embed_watermark_cifar10.py \
+python \path\to\embed_watermark_cifar10.py \
   --use_cifar10 \
   --cifar10_root ./_data \
-  --encoder_path path/to/encoder.pth \
-  --decoder_path path/to/decoder.pth \
+  --subset_size 10000 \
+  --subset_seed 1337 \
+  --encoder_path path/to/cifar10_10k_encoder.pth \
+  --decoder_path path/to/cifar10_10k_decoder.pth \
   --check \
-  --output_dir outputs/cifar10_watermarked \
-  --output_dir_note outputs/cifar10_watermarked_notes \
+  --output_dir outputs/cifar10_10k_watermarked \
+  --output_dir_note outputs/cifar10_10k_watermarked_notes \
   --image_resolution 32 \
   --batch_size 64
 
@@ -174,7 +176,6 @@ def build_transform():
         transforms.ToTensor()
     ])
 
-
 def build_loader_and_namer():
     # CIFAR-10 at native 32x32: just ToTensor; otherwise use generic pipeline.
     transform_pipeline = (
@@ -192,23 +193,18 @@ def build_loader_and_namer():
             transform=transform_pipeline,
         )
 
-        if getattr(args, "cifar10_limit", None) is not None:
-            n = min(args.cifar10_limit, len(base_dataset))
-            indices = list(range(n))
-            dataset = Subset(base_dataset, indices)
-            print(
-                f"[Data] Using CIFAR-10 subset: first {n} images "
-                f"(of {len(base_dataset)} total)."
-            )
+        if args.subset_size and args.subset_size > 0:
+            print(f"[Data] Sampling {args.subset_size} images from CIFAR-10 (seed={args.subset_seed})")
+            g = torch.Generator().manual_seed(args.subset_seed)
+            idx = torch.randperm(len(base_dataset), generator=g)[:args.subset_size]
+            dataset = Subset(base_dataset, idx.tolist())
+            print(f"[Data] Using CIFAR-10 subset: {len(dataset)} / {len(base_dataset)}")
         else:
             dataset = base_dataset
-            print(
-                f"[Data] Using full CIFAR-10 train split: "
-                f"{len(base_dataset)} images."
-            )
+            print(f"[Data] Using full CIFAR-10 train split: {len(dataset)} images.")
 
         def name_fn(index: int) -> str:
-            # Logical index in [0, len(dataset) - 1]
+            # logical index in [0, len(dataset)-1]
             return f"{index:05d}.png"
 
     else:
@@ -230,11 +226,11 @@ def build_loader_and_namer():
                 + ".png"
             )
 
+    # Fix num_workers logic (avoid the ternary mess)
     if args.num_workers is None:
         num_workers = 2 if device.type == "cuda" else 0
     else:
         num_workers = args.num_workers
-
 
     data_loader = DataLoader(
         dataset,
@@ -246,6 +242,8 @@ def build_loader_and_namer():
     )
 
     return dataset, data_loader, name_fn
+
+
 # -----------------------------
 # Models
 # -----------------------------
