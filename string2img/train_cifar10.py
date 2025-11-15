@@ -401,26 +401,26 @@ def main():
         ])
 
     # Dataset (CIFAR-10 recommended)
-    if args.use_cifar10:
-        print(f"Loading CIFAR-10 (root={args.cifar10_root}) ...")
-        # download=True won't re-download if already cached
-        train_full = CIFAR10(root=args.cifar10_root, train=True, download=True,
-                             transform=(transforms.ToTensor() if args.image_resolution == 32 else transform_train))
-        if args.subset_size and args.subset_size > 0:
-            print(f"Sampling {args.subset_size} images from CIFAR-10 (seed={args.subset_seed})")
-            g = torch.Generator().manual_seed(args.subset_seed)
-            idx = torch.randperm(len(train_full), generator=g)[:args.subset_size]
-            train_set = Subset(train_full, idx.tolist())
-            print(f"[Data] Using CIFAR-10 subset: {len(train_set)} / {len(train_full)}")
+        if args.use_cifar10:
+            print(f"Loading CIFAR-10 (root={args.cifar10_root}) ...")
+            # download=True won't re-download if already cached
+            train_full = CIFAR10(root=args.cifar10_root, train=True, download=True,
+                                transform=(transforms.ToTensor() if args.image_resolution == 32 else transform_train))
+            if args.subset_size and args.subset_size > 0:
+                print(f"Sampling {args.subset_size} images from CIFAR-10 (seed={args.subset_seed})")
+                g = torch.Generator().manual_seed(args.subset_seed)
+                idx = torch.randperm(len(train_full), generator=g)[:args.subset_size]
+                train_set = Subset(train_full, idx.tolist())
+                print(f"[Data] Using CIFAR-10 subset: {len(train_set)} / {len(train_full)}")
+            else:
+                train_set = train_full
+                print(f"[Data] Using full CIFAR-10 train set: {len(train_set)}")
         else:
-            train_set = train_full
-            print(f"[Data] Using full CIFAR-10 train set: {len(train_set)}")
-    else:
-        if not args.data_dir:
-            raise ValueError("--data_dir must be set when --use_cifar10 is not provided.")
-        print(f"Loading image folder {args.data_dir} ...")
-        train_set = CustomImageFolder(args.data_dir, transform=transform_train)
-        print(f"[Data] Using flat-folder dataset: {len(train_set)} images")
+            if not args.data_dir:
+                raise ValueError("--data_dir must be set when --use_cifar10 is not provided.")
+            print(f"Loading image folder {args.data_dir} ...")
+            train_set = CustomImageFolder(args.data_dir, transform=transform_train)
+            print(f"[Data] Using flat-folder dataset: {len(train_set)} images")
 
     train_loader = DataLoader(
         train_set,
@@ -462,76 +462,76 @@ def main():
         epoch_bit_acc_sum = 0.0
         epoch_batches = 0
 
-        # Starting fragility training
-        for images, _ in tqdm(train_loader):
-            
-            global_step += 1
+    # Starting fragility training
+    for images, _ in tqdm(train_loader):
+        
+        global_step += 1
 
-            bsz = images.size(0)
-            fingerprints = generate_random_fingerprints(
-                args.bit_length,
-                bsz,
-                (args.image_resolution, args.image_resolution),
+        bsz = images.size(0)
+        fingerprints = generate_random_fingerprints(
+            args.bit_length,
+            bsz,
+            (args.image_resolution, args.image_resolution),
+        )
+
+        # l2 schedule stays exactly as before
+        l2_loss_weight = min(
+            max(0, args.l2_loss_weight * (steps_since_l2_loss_activated - args.l2_loss_await) / args.l2_loss_ramp),
+            args.l2_loss_weight,
+        )
+        BCE_loss_weight = args.BCE_loss_weight
+
+        clean_images = images.to(device)
+        fingerprints = fingerprints.to(device)
+
+        # ----- encoder: clean path -----
+        fingerprinted_images = encoder(fingerprints, clean_images)
+        residual = fingerprinted_images - clean_images
+
+        # clean decode
+        decoder_output_clean = decoder(fingerprinted_images)
+
+        # clean losses
+        l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
+        BCE_loss_clean = nn.BCEWithLogitsLoss()(
+            decoder_output_clean.view(-1),
+            fingerprints.view(-1),
+        )
+
+        # ----- tamper path: attack only the encoded image -----
+        with torch.no_grad():
+            tampered_images = perturbation_bank(
+                fingerprinted_images,
+                strength=args.aug_strength,
             )
 
-            # l2 schedule stays exactly as before
-            l2_loss_weight = min(
-                max(0, args.l2_loss_weight * (steps_since_l2_loss_activated - args.l2_loss_await) / args.l2_loss_ramp),
-                args.l2_loss_weight,
-            )
-            BCE_loss_weight = args.BCE_loss_weight
+        decoder_output_tam = decoder(tampered_images)
 
-            clean_images = images.to(device)
-            fingerprints = fingerprints.to(device)
-
-            # ----- encoder: clean path -----
-            fingerprinted_images = encoder(fingerprints, clean_images)
-            residual = fingerprinted_images - clean_images
-
-            # clean decode
-            decoder_output_clean = decoder(fingerprinted_images)
-
-            # clean losses
-            l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
-            BCE_loss_clean = nn.BCEWithLogitsLoss()(
-                decoder_output_clean.view(-1),
-                fingerprints.view(-1),
-            )
-
-            # ----- tamper path: attack only the encoded image -----
-            with torch.no_grad():
-                tampered_images = perturbation_bank(
-                    fingerprinted_images,
-                    strength=args.aug_strength,
-                )
-
-            decoder_output_tam = decoder(tampered_images)
-
-            # define tamper target and tamper loss
-            if args.tamper_mode == "wrong-string":
-                if args.w_bad.lower() == "zeros":
-                    w_bad = torch.zeros_like(fingerprints)
-                elif args.w_bad.lower() == "ones":
-                    w_bad = torch.ones_like(fingerprints)
-                else:
-                    # default to zeros if unknown
-                    w_bad = torch.zeros_like(fingerprints)
-
-                BCE_loss_tam = nn.BCEWithLogitsLoss()(
-                    decoder_output_tam.view(-1),
-                    w_bad.view(-1),
-                )
-
-            elif args.tamper_mode == "entropy-max":
-                probs_tam = torch.sigmoid(decoder_output_tam)
-                target = 0.5 * torch.ones_like(probs_tam)
-                BCE_loss_tam = nn.BCELoss()(
-                    probs_tam.view(-1),
-                    target.view(-1),
-                )
+        # define tamper target and tamper loss
+        if args.tamper_mode == "wrong-string":
+            if args.w_bad.lower() == "zeros":
+                w_bad = torch.zeros_like(fingerprints)
+            elif args.w_bad.lower() == "ones":
+                w_bad = torch.ones_like(fingerprints)
             else:
-                # safety fallback
-                BCE_loss_tam = torch.tensor(0.0, device=device)
+                # default to zeros if unknown
+                w_bad = torch.zeros_like(fingerprints)
+
+            BCE_loss_tam = nn.BCEWithLogitsLoss()(
+                decoder_output_tam.view(-1),
+                w_bad.view(-1),
+            )
+
+        elif args.tamper_mode == "entropy-max":
+            probs_tam = torch.sigmoid(decoder_output_tam)
+            target = 0.5 * torch.ones_like(probs_tam)
+            BCE_loss_tam = nn.BCELoss()(
+                probs_tam.view(-1),
+                target.view(-1),
+            )
+        else:
+            # safety fallback
+            BCE_loss_tam = torch.tensor(0.0, device=device)
 
         # ----- total loss: clean + fidelity - beta * tamper -----
         loss = (
@@ -597,7 +597,11 @@ def main():
                 )
             
         '''
-        # Optional LEGACY CODE: old image/stat logging
+         # -------------------------------------------------
+            # Legacy image/stat logging & checkpoints 
+            #   - kept here but COMMENTED OUT
+            #   - uncomment if you want full TensorBoard visuals
+            # -------------------------------------------------
         if global_step in plot_points:
             writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
             writer.add_scalar("loss", loss.item(), global_step)
