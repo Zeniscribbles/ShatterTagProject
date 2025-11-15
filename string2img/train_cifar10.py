@@ -453,7 +453,7 @@ def main():
 
     global_step = 0
     steps_since_l2_loss_activated = -1
-    log_every = 100
+    log_every = 1 # 1 for debugging, O.W. 100
     
     for i_epoch in range(args.num_epochs):
         print(f"\n[Train] Starting epoch {i_epoch + 1}/{args.num_epochs}")
@@ -595,8 +595,9 @@ def main():
                     f"tamper_vs_bad={tamper_bit_acc_vs_bad.item():.4f} | "
                     f"l2_w={l2_loss_weight:.3f}"
                 )
-
-        # Optional: old image/stat logging
+            
+        '''
+        # Optional LEGACY CODE: old image/stat logging
         if global_step in plot_points:
             writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
             writer.add_scalar("loss", loss.item(), global_step)
@@ -621,6 +622,7 @@ def main():
             torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_decoder.pth"))
             with open(join(CHECKPOINTS_PATH, f"{EXP_NAME}_variables.txt"), "w") as f:
                 f.write(str(global_step))
+        '''
 
         # ---- end-of-epoch summary ----
         avg_epoch_loss = epoch_loss_sum / max(1, epoch_batches)
