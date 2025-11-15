@@ -72,7 +72,7 @@ import torch
 from torch import nn
 from torch.optim import Adam
 import torch.nn.functional as F
-import torchvision.transforms.functional as
+import torchvision.transforms.functional as TF
 from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10
@@ -84,74 +84,6 @@ from torchvision.utils import make_grid, save_image
 from torch.utils.tensorboard import SummaryWriter # For google colab
 
 import models
-
-
-# -----------------------------
-# Perturbation bank
-# -----------------------------
- """
-    x: (N, C, H, W), values in [0,1]
-    strength in [0, 1]-ish
-    Returns tampered image, no clipping of grad assumed here (caller can no_grad).
-    """
-def perturbation_bank(x, strength: float = 1.0):
-    # build a few small, CIFAR-friendly ops and chain 1–3 of them.
-    def jpeg_like(img):
-        # fake JPEG via down-up-sample
-        N, C, H, W = img.shape
-        scale = 1.0 - 0.02 * strength  # shrink by up to ~2%
-        scale = max(0.5, scale)
-        newH = max(2, int(H * scale))
-        newW = max(2, int(W * scale))
-        img2 = F.interpolate(img, size=(newH, newW), mode="bilinear", align_corners=False)
-        img3 = F.interpolate(img2, size=(H, W), mode="bilinear", align_corners=False)
-        return img3.clamp(0, 1)
-
-    def gauss_noise(img):
-        sigma = (0.5 / 255.0) * strength
-        return (img + sigma * torch.randn_like(img)).clamp(0, 1)
-
-    def blur(img):
-        k = 3 if strength < 0.6 else 5
-        return TF.gaussian_blur(img, kernel_size=k, sigma=0.5 + 0.5 * strength)
-
-    def brightness(img):
-        delta = 0.01 * strength
-        factor = 1.0 + random.choice([-delta, delta])
-        return TF.adjust_brightness(img, factor)
-
-    def tiny_crop(img):
-        N, C, H, W = img.shape
-        pad = max(1, int(0.02 * H * strength))  # tiny crop
-        top = random.randint(0, pad)
-        left = random.randint(0, pad)
-        newH = H - random.randint(0, pad)
-        newW = W - random.randint(0, pad)
-        newH = max(2, newH)
-        newW = max(2, newW)
-        cropped = img[..., top:newH, left:newW]
-        return F.interpolate(cropped, size=(H, W), mode="bilinear", align_corners=False).clamp(0, 1)
-
-    def subpixel_shift(img):
-        N, C, H, W = img.shape
-        dx = 0.5 * strength * random.choice([-1, 1])
-        dy = 0.5 * strength * random.choice([-1, 1])
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=img.device),
-            torch.linspace(-1, 1, W, device=img.device),
-            indexing="ij",
-        )
-        grid = torch.stack((grid_x + dx / W, grid_y + dy / H), dim=-1)
-        grid = grid.unsqueeze(0).expand(N, H, W, 2)
-        return F.grid_sample(img, grid, align_corners=True)
-
-    ops = [jpeg_like, gauss_noise, blur, brightness, tiny_crop, subpixel_shift]
-
-    k = random.randint(1, 3)
-    out = x
-    for f in random.sample(ops, k=k):
-        out = f(out)
-    return out
 
 
 # -----------------------------
@@ -233,7 +165,6 @@ parser.add_argument("--subset_size", type=int, default=0,
 parser.add_argument("--subset_seed", type=int, default=1337,
                     help="RNG seed for subset sampling.")
 
-args = parser.parse_args()
 
 # ----------- For Fragility --------------------
 parser.add_argument("--beta", type=float, default=1.0,
@@ -249,6 +180,7 @@ parser.add_argument("--w_bad", type=str, default="zeros",
 parser.add_argument("--aug_strength", type=float, default=1.0,
                     help="Scales all perturbation magnitudes in bank 𝒜")
 
+args = parser.parse_args()
 # -----------------------------
 # Paths (create BEFORE SummaryWriter)
 # -----------------------------
@@ -261,6 +193,75 @@ os.makedirs(CHECKPOINTS_PATH, exist_ok=True)
 os.makedirs(SAVED_IMAGES, exist_ok=True)
 
 writer = SummaryWriter(LOGS_PATH)
+
+
+# -----------------------------
+# Perturbation bank
+# -----------------------------
+"""
+    x: (N, C, H, W), values in [0,1]
+    strength in [0, 1]-ish
+    Returns tampered image, no clipping of grad assumed here (caller can no_grad).
+"""
+def perturbation_bank(x, strength: float = 1.0):
+    # build a few small, CIFAR-friendly ops and chain 1–3 of them.
+    def jpeg_like(img):
+        # fake JPEG via down-up-sample
+        N, C, H, W = img.shape
+        scale = 1.0 - 0.02 * strength  # shrink by up to ~2%
+        scale = max(0.5, scale)
+        newH = max(2, int(H * scale))
+        newW = max(2, int(W * scale))
+        img2 = F.interpolate(img, size=(newH, newW), mode="bilinear", align_corners=False)
+        img3 = F.interpolate(img2, size=(H, W), mode="bilinear", align_corners=False)
+        return img3.clamp(0, 1)
+
+    def gauss_noise(img):
+        sigma = (0.5 / 255.0) * strength
+        return (img + sigma * torch.randn_like(img)).clamp(0, 1)
+
+    def blur(img):
+        k = 3 if strength < 0.6 else 5
+        return TF.gaussian_blur(img, kernel_size=k, sigma=0.5 + 0.5 * strength)
+
+    def brightness(img):
+        delta = 0.01 * strength
+        factor = 1.0 + random.choice([-delta, delta])
+        return TF.adjust_brightness(img, factor)
+
+    def tiny_crop(img):
+        N, C, H, W = img.shape
+        pad = max(1, int(0.02 * H * strength))  # tiny crop
+        top = random.randint(0, pad)
+        left = random.randint(0, pad)
+        newH = H - random.randint(0, pad)
+        newW = W - random.randint(0, pad)
+        newH = max(2, newH)
+        newW = max(2, newW)
+        cropped = img[..., top:newH, left:newW]
+        return F.interpolate(cropped, size=(H, W), mode="bilinear", align_corners=False).clamp(0, 1)
+
+    def subpixel_shift(img):
+        N, C, H, W = img.shape
+        dx = 0.5 * strength * random.choice([-1, 1])
+        dy = 0.5 * strength * random.choice([-1, 1])
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=img.device),
+            torch.linspace(-1, 1, W, device=img.device),
+            indexing="ij",
+        )
+        grid = torch.stack((grid_x + dx / W, grid_y + dy / H), dim=-1)
+        grid = grid.unsqueeze(0).expand(N, H, W, 2)
+        return F.grid_sample(img, grid, align_corners=True)
+
+    ops = [jpeg_like, gauss_noise, blur, brightness, tiny_crop, subpixel_shift]
+
+    k = random.randint(1, 3)
+    out = x
+    for f in random.sample(ops, k=k):
+        out = f(out)
+    return out
+
 
 # -----------------------------
 # Utils
@@ -463,71 +464,72 @@ def main():
 
         # Starting fragility training
         for images, _ in tqdm(train_loader):
-                    bsz = images.size(0)
-        fingerprints = generate_random_fingerprints(
-            args.bit_length,
-            bsz,
-            (args.image_resolution, args.image_resolution),
-        )
-
-        # l2 schedule stays exactly as before
-        l2_loss_weight = min(
-            max(0, args.l2_loss_weight * (steps_since_l2_loss_activated - args.l2_loss_await) / args.l2_loss_ramp),
-            args.l2_loss_weight,
-        )
-        BCE_loss_weight = args.BCE_loss_weight
-
-        clean_images = images.to(device)
-        fingerprints = fingerprints.to(device)
-
-        # ----- encoder: clean path -----
-        fingerprinted_images = encoder(fingerprints, clean_images)
-        residual = fingerprinted_images - clean_images
-
-        # clean decode
-        decoder_output_clean = decoder(fingerprinted_images)
-
-        # clean losses
-        l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
-        BCE_loss_clean = nn.BCEWithLogitsLoss()(
-            decoder_output_clean.view(-1),
-            fingerprints.view(-1),
-        )
-
-        # ----- tamper path: attack only the encoded image -----
-        with torch.no_grad():
-            tampered_images = perturbation_bank(
-                fingerprinted_images,
-                strength=args.aug_strength,
+            bsz = images.size(0)
+            
+            fingerprints = generate_random_fingerprints(
+                args.bit_length,
+                bsz,
+                (args.image_resolution, args.image_resolution),
             )
 
-        decoder_output_tam = decoder(tampered_images)
+            # l2 schedule stays exactly as before
+            l2_loss_weight = min(
+                max(0, args.l2_loss_weight * (steps_since_l2_loss_activated - args.l2_loss_await) / args.l2_loss_ramp),
+                args.l2_loss_weight,
+            )
+            BCE_loss_weight = args.BCE_loss_weight
 
-        # define tamper target and tamper loss
-        if args.tamper_mode == "wrong-string":
-            if args.w_bad.lower() == "zeros":
-                w_bad = torch.zeros_like(fingerprints)
-            elif args.w_bad.lower() == "ones":
-                w_bad = torch.ones_like(fingerprints)
+            clean_images = images.to(device)
+            fingerprints = fingerprints.to(device)
+
+            # ----- encoder: clean path -----
+            fingerprinted_images = encoder(fingerprints, clean_images)
+            residual = fingerprinted_images - clean_images
+
+            # clean decode
+            decoder_output_clean = decoder(fingerprinted_images)
+
+            # clean losses
+            l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
+            BCE_loss_clean = nn.BCEWithLogitsLoss()(
+                decoder_output_clean.view(-1),
+                fingerprints.view(-1),
+            )
+
+            # ----- tamper path: attack only the encoded image -----
+            with torch.no_grad():
+                tampered_images = perturbation_bank(
+                    fingerprinted_images,
+                    strength=args.aug_strength,
+                )
+
+            decoder_output_tam = decoder(tampered_images)
+
+            # define tamper target and tamper loss
+            if args.tamper_mode == "wrong-string":
+                if args.w_bad.lower() == "zeros":
+                    w_bad = torch.zeros_like(fingerprints)
+                elif args.w_bad.lower() == "ones":
+                    w_bad = torch.ones_like(fingerprints)
+                else:
+                    # default to zeros if unknown
+                    w_bad = torch.zeros_like(fingerprints)
+
+                BCE_loss_tam = nn.BCEWithLogitsLoss()(
+                    decoder_output_tam.view(-1),
+                    w_bad.view(-1),
+                )
+
+            elif args.tamper_mode == "entropy-max":
+                probs_tam = torch.sigmoid(decoder_output_tam)
+                target = 0.5 * torch.ones_like(probs_tam)
+                BCE_loss_tam = nn.BCELoss()(
+                    probs_tam.view(-1),
+                    target.view(-1),
+                )
             else:
-                # default to zeros if unknown
-                w_bad = torch.zeros_like(fingerprints)
-
-            BCE_loss_tam = nn.BCEWithLogitsLoss()(
-                decoder_output_tam.view(-1),
-                w_bad.view(-1),
-            )
-
-        elif args.tamper_mode == "entropy-max":
-            probs_tam = torch.sigmoid(decoder_output_tam)
-            target = 0.5 * torch.ones_like(probs_tam)
-            BCE_loss_tam = nn.BCELoss()(
-                probs_tam.view(-1),
-                target.view(-1),
-            )
-        else:
-            # safety fallback
-            BCE_loss_tam = torch.tensor(0.0, device=device)
+                # safety fallback
+                BCE_loss_tam = torch.tensor(0.0, device=device)
 
         # ----- total loss: clean + fidelity - beta * tamper -----
         loss = (
@@ -567,51 +569,51 @@ def main():
             },
             global_step,
         )
-            # Legacy Code: Stay as-is
-            if steps_since_l2_loss_activated == -1:
-                if bitwise_accuracy.item() > 0.9:
-                    steps_since_l2_loss_activated = 0
-            else:
-                steps_since_l2_loss_activated += 1
+        # Legacy Code: Stay as-is
+        if steps_since_l2_loss_activated == -1:
+            if bitwise_accuracy.item() > 0.9:
+                steps_since_l2_loss_activated = 0
+        else:
+            steps_since_l2_loss_activated += 1
 
-            # ---- epoch stats accumulation ----
-            epoch_loss_sum += loss.item()
-            epoch_bit_acc_sum += bitwise_accuracy.item()
-            epoch_batches += 1
+        # ---- epoch stats accumulation ----
+        epoch_loss_sum += loss.item()
+        epoch_bit_acc_sum += bitwise_accuracy.item()
+        epoch_batches += 1
 
-            # ---- occasional console logging ----
-            if global_step % log_every == 0:
-                print(
-                    f"[Train] step {global_step} | "
-                    f"loss={loss.item():.4f} | "
-                    f"bitwise_acc={bitwise_accuracy.item():.4f} | "
-                    f"l2_w={l2_loss_weight:.3f}"
-                )
+        # ---- occasional console logging ----
+        if global_step % log_every == 0:
+            print(
+                f"[Train] step {global_step} | "
+                f"loss={loss.item():.4f} | "
+                f"bitwise_acc={bitwise_accuracy.item():.4f} | "
+                f"l2_w={l2_loss_weight:.3f}"
+            )
 
-            if global_step in plot_points:
-                writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
-                writer.add_scalar("loss", loss.item(), global_step)
-                writer.add_scalar("BCE_loss", BCE_loss.item(), global_step)
+        if global_step in plot_points:
+            writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
+            writer.add_scalar("loss", loss.item(), global_step)
+            writer.add_scalar("BCE_loss", BCE_loss_clean.item(), global_step)
 
-                writer.add_scalars("clean_statistics", {"min": clean_images.min(), "max": clean_images.max()}, global_step)
-                writer.add_scalars("with_fingerprint_statistics", {"min": fingerprinted_images.min(), "max": fingerprinted_images.max()}, global_step)
-                writer.add_scalars("residual_statistics", {"min": residual.min(), "max": residual.max(), "mean_abs": residual.abs().mean()}, global_step)
+            writer.add_scalars("clean_statistics", {"min": clean_images.min(), "max": clean_images.max()}, global_step)
+            writer.add_scalars("with_fingerprint_statistics", {"min": fingerprinted_images.min(), "max": fingerprinted_images.max()}, global_step)
+            writer.add_scalars("residual_statistics", {"min": residual.min(), "max": residual.max(), "mean_abs": residual.abs().mean()}, global_step)
 
-                writer.add_image("clean_image", make_grid(clean_images, normalize=True), global_step)
-                writer.add_image("residual", make_grid(residual, normalize=True, scale_each=True), global_step)
-                writer.add_image("image_with_fingerprint", make_grid(fingerprinted_images, normalize=True), global_step)
+            writer.add_image("clean_image", make_grid(clean_images, normalize=True), global_step)
+            writer.add_image("residual", make_grid(residual, normalize=True, scale_each=True), global_step)
+            writer.add_image("image_with_fingerprint", make_grid(fingerprinted_images, normalize=True), global_step)
 
-                save_image(fingerprinted_images, join(SAVED_IMAGES, f"{global_step}.png"), normalize=True)
+            save_image(fingerprinted_images, join(SAVED_IMAGES, f"{global_step}.png"), normalize=True)
 
-                writer.add_scalar("loss_weights/l2_loss_weight", l2_loss_weight, global_step)
-                writer.add_scalar("loss_weights/BCE_loss_weight", BCE_loss_weight, global_step)
+            writer.add_scalar("loss_weights/l2_loss_weight", l2_loss_weight, global_step)
+            writer.add_scalar("loss_weights/BCE_loss_weight", BCE_loss_weight, global_step)
 
-            if global_step % 5000 == 0:
-                torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_optim.pth"))
-                torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_encoder.pth"))
-                torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_decoder.pth"))
-                with open(join(CHECKPOINTS_PATH, f"{EXP_NAME}_variables.txt"), "w") as f:
-                    f.write(str(global_step))
+        if global_step % 5000 == 0:
+            torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_optim.pth"))
+            torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_encoder.pth"))
+            torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_decoder.pth"))
+            with open(join(CHECKPOINTS_PATH, f"{EXP_NAME}_variables.txt"), "w") as f:
+                f.write(str(global_step))
 
         # ---- end-of-epoch summary ----
         avg_epoch_loss = epoch_loss_sum / max(1, epoch_batches)
