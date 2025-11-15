@@ -462,171 +462,171 @@ def main():
         epoch_bit_acc_sum = 0.0
         epoch_batches = 0
 
-    # Starting fragility training
-    for images, _ in tqdm(train_loader):
-        
-        global_step += 1
-
-        bsz = images.size(0)
-        fingerprints = generate_random_fingerprints(
-            args.bit_length,
-            bsz,
-            (args.image_resolution, args.image_resolution),
-        )
-
-        # l2 schedule stays exactly as before
-        l2_loss_weight = min(
-            max(0, args.l2_loss_weight * (steps_since_l2_loss_activated - args.l2_loss_await) / args.l2_loss_ramp),
-            args.l2_loss_weight,
-        )
-        BCE_loss_weight = args.BCE_loss_weight
-
-        clean_images = images.to(device)
-        fingerprints = fingerprints.to(device)
-
-        # ----- encoder: clean path -----
-        fingerprinted_images = encoder(fingerprints, clean_images)
-        residual = fingerprinted_images - clean_images
-
-        # clean decode
-        decoder_output_clean = decoder(fingerprinted_images)
-
-        # clean losses
-        l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
-        BCE_loss_clean = nn.BCEWithLogitsLoss()(
-            decoder_output_clean.view(-1),
-            fingerprints.view(-1),
-        )
-
-        # ----- tamper path: attack only the encoded image -----
-        with torch.no_grad():
-            tampered_images = perturbation_bank(
-                fingerprinted_images,
-                strength=args.aug_strength,
-            )
-
-        decoder_output_tam = decoder(tampered_images)
-
-        # define tamper target and tamper loss
-        if args.tamper_mode == "wrong-string":
-            if args.w_bad.lower() == "zeros":
-                w_bad = torch.zeros_like(fingerprints)
-            elif args.w_bad.lower() == "ones":
-                w_bad = torch.ones_like(fingerprints)
-            else:
-                # default to zeros if unknown
-                w_bad = torch.zeros_like(fingerprints)
-
-            BCE_loss_tam = nn.BCEWithLogitsLoss()(
-                decoder_output_tam.view(-1),
-                w_bad.view(-1),
-            )
-
-        elif args.tamper_mode == "entropy-max":
-            probs_tam = torch.sigmoid(decoder_output_tam)
-            target = 0.5 * torch.ones_like(probs_tam)
-            BCE_loss_tam = nn.BCELoss()(
-                probs_tam.view(-1),
-                target.view(-1),
-            )
-        else:
-            # safety fallback
-            BCE_loss_tam = torch.tensor(0.0, device=device)
-
-        # ----- total loss: clean + fidelity - beta * tamper -----
-        loss = (
-            l2_loss_weight * l2_loss
-            + BCE_loss_weight * BCE_loss_clean
-            - args.beta * BCE_loss_tam
-        )
-
-        encoder.zero_grad(set_to_none=True)
-        decoder.zero_grad(set_to_none=True)
-        loss.backward()
-        decoder_encoder_optim.step()
-
-        # ----- clean bitwise accuracy (used for l2 schedule + logging) -----
-        fingerprints_predicted = (decoder_output_clean > 0).float()
-        bitwise_accuracy = 1.0 - torch.mean(torch.abs(fingerprints - fingerprints_predicted))
-
-        # optional: tamper metrics (if you want to log them later)
-        tamper_pred = (decoder_output_tam > 0).float()
-        tamper_bit_acc_vs_true = 1.0 - torch.mean(torch.abs(fingerprints - tamper_pred))
-        if args.tamper_mode == "wrong-string":
-            tamper_bit_acc_vs_bad = 1.0 - torch.mean(torch.abs(w_bad - tamper_pred))
-        else:
-            tamper_bit_acc_vs_bad = torch.tensor(0.0, device=device)
-
-
-        # -----------------------------------------
-        # TensorBoard logging for fragility stuff
-        # -----------------------------------------
-        writer.add_scalar("train/BCE_loss_tam", BCE_loss_tam.item(), global_step)
-
-        writer.add_scalars(
-            "train/tamper_bitwise_acc",
-            {
-                "vs_true": tamper_bit_acc_vs_true.item(),
-                "vs_bad": tamper_bit_acc_vs_bad.item(),
-            },
-            global_step,
-        )
-        # Legacy Code: Stay as-is
-        if steps_since_l2_loss_activated == -1:
-            if bitwise_accuracy.item() > 0.9:
-                steps_since_l2_loss_activated = 0
-        else:
-            steps_since_l2_loss_activated += 1
-
-        # ---- epoch stats accumulation ----
-        epoch_loss_sum += loss.item()
-        epoch_bit_acc_sum += bitwise_accuracy.item()
-        epoch_batches += 1
-
-        # ---- occasional console logging ----
-        if global_step % log_every == 0:
-            print(
-                    f"[Train] step {global_step} | "
-                    f"loss={loss.item():.4f} | "
-                    f"clean_BCE={BCE_loss_clean.item():.4f} | "
-                    f"tam_BCE={BCE_loss_tam.item():.4f} | "
-                    f"bitwise_acc={bitwise_accuracy.item():.4f} | "
-                    f"tamper_vs_true={tamper_bit_acc_vs_true.item():.4f} | "
-                    f"tamper_vs_bad={tamper_bit_acc_vs_bad.item():.4f} | "
-                    f"l2_w={l2_loss_weight:.3f}"
-                )
+        # Starting fragility training
+        for images, _ in tqdm(train_loader):
             
-        '''
-         # -------------------------------------------------
-            # Legacy image/stat logging & checkpoints 
-            #   - kept here but COMMENTED OUT
-            #   - uncomment if you want full TensorBoard visuals
+            global_step += 1
+
+            bsz = images.size(0)
+            fingerprints = generate_random_fingerprints(
+                args.bit_length,
+                bsz,
+                (args.image_resolution, args.image_resolution),
+            )
+
+            # l2 schedule stays exactly as before
+            l2_loss_weight = min(
+                max(0, args.l2_loss_weight * (steps_since_l2_loss_activated - args.l2_loss_await) / args.l2_loss_ramp),
+                args.l2_loss_weight,
+            )
+            BCE_loss_weight = args.BCE_loss_weight
+
+            clean_images = images.to(device)
+            fingerprints = fingerprints.to(device)
+
+            # ----- encoder: clean path -----
+            fingerprinted_images = encoder(fingerprints, clean_images)
+            residual = fingerprinted_images - clean_images
+
+            # clean decode
+            decoder_output_clean = decoder(fingerprinted_images)
+
+            # clean losses
+            l2_loss = nn.MSELoss()(fingerprinted_images, clean_images)
+            BCE_loss_clean = nn.BCEWithLogitsLoss()(
+                decoder_output_clean.view(-1),
+                fingerprints.view(-1),
+            )
+
+            # ----- tamper path: attack only the encoded image -----
+            with torch.no_grad():
+                tampered_images = perturbation_bank(
+                    fingerprinted_images,
+                    strength=args.aug_strength,
+                )
+
+            decoder_output_tam = decoder(tampered_images)
+
+            # define tamper target and tamper loss
+            if args.tamper_mode == "wrong-string":
+                if args.w_bad.lower() == "zeros":
+                    w_bad = torch.zeros_like(fingerprints)
+                elif args.w_bad.lower() == "ones":
+                    w_bad = torch.ones_like(fingerprints)
+                else:
+                    # default to zeros if unknown
+                    w_bad = torch.zeros_like(fingerprints)
+
+                BCE_loss_tam = nn.BCEWithLogitsLoss()(
+                    decoder_output_tam.view(-1),
+                    w_bad.view(-1),
+                )
+
+            elif args.tamper_mode == "entropy-max":
+                probs_tam = torch.sigmoid(decoder_output_tam)
+                target = 0.5 * torch.ones_like(probs_tam)
+                BCE_loss_tam = nn.BCELoss()(
+                    probs_tam.view(-1),
+                    target.view(-1),
+                )
+            else:
+                # safety fallback
+                BCE_loss_tam = torch.tensor(0.0, device=device)
+
+            # ----- total loss: clean + fidelity - beta * tamper -----
+            loss = (
+                l2_loss_weight * l2_loss
+                + BCE_loss_weight * BCE_loss_clean
+                - args.beta * BCE_loss_tam
+            )
+
+            encoder.zero_grad(set_to_none=True)
+            decoder.zero_grad(set_to_none=True)
+            loss.backward()
+            decoder_encoder_optim.step()
+
+            # ----- clean bitwise accuracy (used for l2 schedule + logging) -----
+            fingerprints_predicted = (decoder_output_clean > 0).float()
+            bitwise_accuracy = 1.0 - torch.mean(torch.abs(fingerprints - fingerprints_predicted))
+
+            # optional: tamper metrics (if you want to log them later)
+            tamper_pred = (decoder_output_tam > 0).float()
+            tamper_bit_acc_vs_true = 1.0 - torch.mean(torch.abs(fingerprints - tamper_pred))
+            if args.tamper_mode == "wrong-string":
+                tamper_bit_acc_vs_bad = 1.0 - torch.mean(torch.abs(w_bad - tamper_pred))
+            else:
+                tamper_bit_acc_vs_bad = torch.tensor(0.0, device=device)
+
+
+            # -----------------------------------------
+            # TensorBoard logging for fragility stuff
+            # -----------------------------------------
+            writer.add_scalar("train/BCE_loss_tam", BCE_loss_tam.item(), global_step)
+
+            writer.add_scalars(
+                "train/tamper_bitwise_acc",
+                {
+                    "vs_true": tamper_bit_acc_vs_true.item(),
+                    "vs_bad": tamper_bit_acc_vs_bad.item(),
+                },
+                global_step,
+            )
+            # Legacy Code: Stay as-is
+            if steps_since_l2_loss_activated == -1:
+                if bitwise_accuracy.item() > 0.9:
+                    steps_since_l2_loss_activated = 0
+            else:
+                steps_since_l2_loss_activated += 1
+
+            # ---- epoch stats accumulation ----
+            epoch_loss_sum += loss.item()
+            epoch_bit_acc_sum += bitwise_accuracy.item()
+            epoch_batches += 1
+
+            # ---- occasional console logging ----
+            if global_step % log_every == 0:
+                print(
+                        f"[Train] step {global_step} | "
+                        f"loss={loss.item():.4f} | "
+                        f"clean_BCE={BCE_loss_clean.item():.4f} | "
+                        f"tam_BCE={BCE_loss_tam.item():.4f} | "
+                        f"bitwise_acc={bitwise_accuracy.item():.4f} | "
+                        f"tamper_vs_true={tamper_bit_acc_vs_true.item():.4f} | "
+                        f"tamper_vs_bad={tamper_bit_acc_vs_bad.item():.4f} | "
+                        f"l2_w={l2_loss_weight:.3f}"
+                    )
+                
+            '''
             # -------------------------------------------------
-        if global_step in plot_points:
-            writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
-            writer.add_scalar("loss", loss.item(), global_step)
-            writer.add_scalar("BCE_loss", BCE_loss_clean.item(), global_step)
+                # Legacy image/stat logging & checkpoints 
+                #   - kept here but COMMENTED OUT
+                #   - uncomment if you want full TensorBoard visuals
+                # -------------------------------------------------
+            if global_step in plot_points:
+                writer.add_scalar("bitwise_accuracy", bitwise_accuracy.item(), global_step)
+                writer.add_scalar("loss", loss.item(), global_step)
+                writer.add_scalar("BCE_loss", BCE_loss_clean.item(), global_step)
 
-            writer.add_scalars("clean_statistics", {"min": clean_images.min(), "max": clean_images.max()}, global_step)
-            writer.add_scalars("with_fingerprint_statistics", {"min": fingerprinted_images.min(), "max": fingerprinted_images.max()}, global_step)
-            writer.add_scalars("residual_statistics", {"min": residual.min(), "max": residual.max(), "mean_abs": residual.abs().mean()}, global_step)
+                writer.add_scalars("clean_statistics", {"min": clean_images.min(), "max": clean_images.max()}, global_step)
+                writer.add_scalars("with_fingerprint_statistics", {"min": fingerprinted_images.min(), "max": fingerprinted_images.max()}, global_step)
+                writer.add_scalars("residual_statistics", {"min": residual.min(), "max": residual.max(), "mean_abs": residual.abs().mean()}, global_step)
 
-            writer.add_image("clean_image", make_grid(clean_images, normalize=True), global_step)
-            writer.add_image("residual", make_grid(residual, normalize=True, scale_each=True), global_step)
-            writer.add_image("image_with_fingerprint", make_grid(fingerprinted_images, normalize=True), global_step)
+                writer.add_image("clean_image", make_grid(clean_images, normalize=True), global_step)
+                writer.add_image("residual", make_grid(residual, normalize=True, scale_each=True), global_step)
+                writer.add_image("image_with_fingerprint", make_grid(fingerprinted_images, normalize=True), global_step)
 
-            save_image(fingerprinted_images, join(SAVED_IMAGES, f"{global_step}.png"), normalize=True)
+                save_image(fingerprinted_images, join(SAVED_IMAGES, f"{global_step}.png"), normalize=True)
 
-            writer.add_scalar("loss_weights/l2_loss_weight", l2_loss_weight, global_step)
-            writer.add_scalar("loss_weights/BCE_loss_weight", BCE_loss_weight, global_step)
+                writer.add_scalar("loss_weights/l2_loss_weight", l2_loss_weight, global_step)
+                writer.add_scalar("loss_weights/BCE_loss_weight", BCE_loss_weight, global_step)
 
-        if global_step % 5000 == 0:
-            torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_optim.pth"))
-            torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_encoder.pth"))
-            torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_decoder.pth"))
-            with open(join(CHECKPOINTS_PATH, f"{EXP_NAME}_variables.txt"), "w") as f:
-                f.write(str(global_step))
-        '''
+            if global_step % 5000 == 0:
+                torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_optim.pth"))
+                torch.save(encoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_encoder.pth"))
+                torch.save(decoder.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_decoder.pth"))
+                with open(join(CHECKPOINTS_PATH, f"{EXP_NAME}_variables.txt"), "w") as f:
+                    f.write(str(global_step))
+            '''
 
         # ---- end-of-epoch summary ----
         avg_epoch_loss = epoch_loss_sum / max(1, epoch_batches)
