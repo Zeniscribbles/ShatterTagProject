@@ -404,13 +404,17 @@ def main():
 
     fragility_active = False  # will flip to True once bitwise_acc crosses threshold
     decoder_frozen_for_frag = False  # Has decoder been frozen already?
-
+    
+    
     for i_epoch in range(args.num_epochs):
         print(f"\n[Train] Starting epoch {i_epoch + 1}/{args.num_epochs}")
         
         epoch_loss_sum = 0.0
         epoch_bit_acc_sum = 0.0
         epoch_batches = 0
+
+        # minimum warmup before fragility can activate
+        MIN_WARMUP_STEPS = 1000  # You can tune this (500–2000 for CIFAR10)
 
         # Starting fragility training
         for images, _ in tqdm(train_loader):
@@ -465,10 +469,17 @@ def main():
             bitwise_accuracy = 1.0 - torch.mean(torch.abs(fingerprints - fingerprints_predicted))
 
             # ----- fragility activation & decoder freezing -----
-            if (not fragility_active) and (bitwise_accuracy.item() > args.frag_bitacc_threshold):
+            if (not fragility_active) \
+                and (global_step > MIN_WARMUP_STEPS) \
+                and (bitwise_accuracy.item() > args.frag_bitacc_threshold):
+                
                 fragility_active = True
                 print(f"[Train] Activating fragility at step {global_step}, "
-                      f"bitwise_acc={bitwise_accuracy.item():.4f}")
+                      f"Clean bitwise_acc={bitwise_accuracy.item():.4f}")
+
+                # Freeze decoder immediately once fragility starts
+                set_decoder_trainable(decoder, False)
+                decoder_frozen_for_frag = True
 
             # effective beta: 0 before activation, args.beta after
             beta_eff = args.beta if fragility_active else 0.0 
@@ -492,16 +503,13 @@ def main():
             # -----------------------------------------
             # TensorBoard logging for fragility stuff
             # -----------------------------------------
-            writer.add_scalar("train/BCE_loss_tam", BCE_loss_tam.item(), global_step)
+            writer.add_scalar("train/clean_bit_acc", bitwise_accuracy.item(), global_step)
+            writer.add_scalar("train/tamper_bit_acc", tamper_bit_acc_vs_true.item(), global_step)
             writer.add_scalar("train/fragility_active", float(fragility_active), global_step)
-
-            writer.add_scalars(
-                "train/tamper_bitwise_acc",
-                {
-                    "vs_true": tamper_bit_acc_vs_true.item(),
-                },
-                global_step,
-            )
+            writer.add_scalar("train/decoder_frozen", float(decoder_frozen_for_frag), global_step)
+            writer.add_scalar("train/BCE_loss_clean", BCE_loss_clean.item(), global_step)
+            writer.add_scalar("train/BCE_loss_tam", BCE_loss_tam.item(), global_step)
+            
             # Legacy Code: Stay as-is
             if steps_since_l2_loss_activated == -1:
                 if bitwise_accuracy.item() > 0.9:
