@@ -140,6 +140,14 @@ parser.add_argument("--beta", type=float, default=1.0,
 parser.add_argument("--aug_strength", type=float, default=1.0,
                     help="Scales all perturbation magnitudes in bank 𝒜")
 
+parser.add_argument(
+    "--frag_bitacc_threshold",
+    type=float,
+    default=0.9,
+    help="Clean Bitwise accuracy threshold to achieve before applying the fragility term.",
+)
+
+
 args = parser.parse_args()
 # -----------------------------
 # Paths (create BEFORE SummaryWriter)
@@ -363,6 +371,28 @@ def main():
     #encoder.train()
     #decoder.train()
 
+    encoder = models.StegaStampEncoder(
+        args.image_resolution,
+        IMAGE_CHANNELS,
+        args.bit_length,
+        return_residual=False,
+    )
+    decoder = models.StegaStampDecoder(
+        args.image_resolution,
+        IMAGE_CHANNELS,
+        args.bit_length,
+    )
+    encoder = encoder.to(device)
+    decoder = decoder.to(device)
+
+    # Helper to freeze/unfreeze decoder params
+    def set_decoder_trainable(dec, trainable: bool):
+        for p in dec.parameters():
+            p.requires_grad = trainable
+
+    # Initially, decoder is trainable during robust phase
+    set_decoder_trainable(decoder, True)
+
     decoder_encoder_optim = Adam(params=list(decoder.parameters()) + list(encoder.parameters()), lr=args.lr)
     torch.backends.cudnn.benchmark = True
 
@@ -371,6 +401,9 @@ def main():
     log_every = 1 # 1 for debugging, O.W. 100
     bce_logits = nn.BCEWithLogitsLoss()
     mse_loss = nn.MSELoss()
+
+    fragility_active = False  # will flip to True once bitwise_acc crosses threshold
+    decoder_frozen_for_frag = False  # Has decoder been frozen already?
 
     for i_epoch in range(args.num_epochs):
         print(f"\n[Train] Starting epoch {i_epoch + 1}/{args.num_epochs}")
@@ -402,7 +435,7 @@ def main():
             fingerprints = fingerprints.to(device)
 
             # ----- encoder: clean path -----
-            fingerprinted_images = encoder(fingerprints, clean_images)
+            fingerprinted_images = encoder(fingerprints, clean_images)            
             # residual = fingerprinted_images - clean_images logging/visualization
 
             # clean decode
@@ -416,12 +449,10 @@ def main():
             )
 
             # ----- tamper path: attack only the encoded image -----
-            with torch.no_grad():
-                tampered_images = perturbation_bank(
-                    fingerprinted_images,
-                    strength=args.aug_strength,
-                )
-
+            tampered_images = perturbation_bank(
+                fingerprinted_images,
+                strength=args.aug_strength,
+            )
             decoder_output_tam = decoder(tampered_images)
 
             BCE_loss_tam = bce_logits(
@@ -429,21 +460,30 @@ def main():
                 fingerprints.view(-1),   # target = TRUE watermark bits
             )
 
+             # ----- clean bitwise accuracy (used for schedules + fragility switch) -----
+            fingerprints_predicted = (decoder_output_clean > 0).float()
+            bitwise_accuracy = 1.0 - torch.mean(torch.abs(fingerprints - fingerprints_predicted))
+
+            # ----- fragility activation & decoder freezing -----
+            if (not fragility_active) and (bitwise_accuracy.item() > args.frag_bitacc_threshold):
+                fragility_active = True
+                print(f"[Train] Activating fragility at step {global_step}, "
+                      f"bitwise_acc={bitwise_accuracy.item():.4f}")
+
+            # effective beta: 0 before activation, args.beta after
+            beta_eff = args.beta if fragility_active else 0.0 
+
             # ----- total loss: clean + fidelity - beta * tamper -----
             loss = (
                 l2_loss_weight * l2_loss
                 + BCE_loss_weight * BCE_loss_clean
-                - args.beta * BCE_loss_tam
+                - beta_eff * BCE_loss_tam
             )
 
             encoder.zero_grad(set_to_none=True)
             decoder.zero_grad(set_to_none=True)
             loss.backward()
             decoder_encoder_optim.step()
-
-            # ----- clean bitwise accuracy (used for l2 schedule + logging) -----
-            fingerprints_predicted = (decoder_output_clean > 0).float()
-            bitwise_accuracy = 1.0 - torch.mean(torch.abs(fingerprints - fingerprints_predicted))
 
             # optional: tamper metrics (if you want to log them later)
             tamper_pred = (decoder_output_tam > 0).float()
@@ -453,6 +493,7 @@ def main():
             # TensorBoard logging for fragility stuff
             # -----------------------------------------
             writer.add_scalar("train/BCE_loss_tam", BCE_loss_tam.item(), global_step)
+            writer.add_scalar("train/fragility_active", float(fragility_active), global_step)
 
             writer.add_scalars(
                 "train/tamper_bitwise_acc",
@@ -476,14 +517,16 @@ def main():
             # ---- occasional console logging ----
             if global_step % log_every == 0:
                 print(
-                        f"[Train] step {global_step} | "
-                        f"loss={loss.item():.4f} | "
-                        f"clean_BCE={BCE_loss_clean.item():.4f} | "
-                        f"tam_BCE={BCE_loss_tam.item():.4f} | "
-                        f"bitwise_acc={bitwise_accuracy.item():.4f} | "
-                        f"tamper_vs_true={tamper_bit_acc_vs_true.item():.4f} | "
-                        f"l2_w={l2_loss_weight:.3f}"
-                    )
+                    f"[Train] step {global_step} | "
+                    f"loss={loss.item():.4f} | "
+                    f"clean_BCE={BCE_loss_clean.item():.4f} | "
+                    f"tam_BCE={BCE_loss_tam.item():.4f} | "
+                    f"bitwise_acc={bitwise_accuracy.item():.4f} | "
+                    f"tamper_vs_true={tamper_bit_acc_vs_true.item():.4f} | "
+                    f"l2_w={l2_loss_weight:.3f} | "
+                    f"frag_active={fragility_active} | "
+                    f"decoder_frozen={decoder_frozen_for_frag}"
+                )
                 
             '''
             # -------------------------------------------------
