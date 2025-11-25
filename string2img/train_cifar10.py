@@ -43,6 +43,8 @@ import torchvision.transforms.functional as TF
 from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10
+from perturbations.cifar_perturbations import cifar10_perturbation_bank as perturbation_bank
+
 
 # from torchvision.datasets import ImageFolder
 from torchvision.utils import make_grid, save_image
@@ -162,7 +164,7 @@ os.makedirs(SAVED_IMAGES, exist_ok=True)
 
 writer = SummaryWriter(LOGS_PATH)
 
-
+'''
 # -----------------------------
 # Perturbation bank
 # -----------------------------
@@ -229,7 +231,7 @@ def perturbation_bank(x, strength: float = 1.0):
     for f in random.sample(ops, k=k):
         out = f(out)
     return out
-
+'''
 
 # -----------------------------
 # Utils
