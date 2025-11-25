@@ -65,7 +65,15 @@ def perturbation_bank(x, strength: float = 1.0):
     ops = [jpeg_like, gauss_noise, blur, brightness, tiny_crop, subpixel_shift]
 
     k = random.randint(1, 3)
+    chose_ops = random.sample(ops, k=k)
+
     out = x
     for f in random.sample(ops, k=k):
         out = f(out)
+
+    if return_ops:
+        # use function __name__ as the identifier
+        used_names = [f.__name__ for f in chosen_ops]
+        return out, used_names
+        
     return out

@@ -43,7 +43,7 @@ import torchvision.transforms.functional as TF
 from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10
-from perturbations.cifar_perturbations import cifar10_perturbation_bank as perturbation_bank
+from cifar10_perturbations_bank import perturbation_bank
 
 
 # from torchvision.datasets import ImageFolder
@@ -164,75 +164,6 @@ os.makedirs(SAVED_IMAGES, exist_ok=True)
 
 writer = SummaryWriter(LOGS_PATH)
 
-'''
-# -----------------------------
-# Perturbation bank
-# -----------------------------
-"""
-    x: (N, C, H, W), values in [0,1]
-    strength in [0, 1]-ish
-    Returns tampered image, no clipping of grad assumed here (caller can no_grad).
-"""
-def perturbation_bank(x, strength: float = 1.0):
-    # build a few small, CIFAR-friendly ops and chain 1–3 of them.
-    def jpeg_like(img):
-        # fake JPEG via down-up-sample
-        N, C, H, W = img.shape
-        scale = 1.0 - 0.02 * strength  # shrink by up to ~2%
-        scale = max(0.5, scale)
-        newH = max(2, int(H * scale))
-        newW = max(2, int(W * scale))
-        img2 = F.interpolate(img, size=(newH, newW), mode="bilinear", align_corners=False)
-        img3 = F.interpolate(img2, size=(H, W), mode="bilinear", align_corners=False)
-        return img3.clamp(0, 1)
-
-    def gauss_noise(img):
-        sigma = (0.5 / 255.0) * strength
-        return (img + sigma * torch.randn_like(img)).clamp(0, 1)
-
-    def blur(img):
-        k = 3 if strength < 0.6 else 5
-        return TF.gaussian_blur(img, kernel_size=k, sigma=0.5 + 0.5 * strength)
-
-    def brightness(img):
-        delta = 0.01 * strength
-        factor = 1.0 + random.choice([-delta, delta])
-        return TF.adjust_brightness(img, factor)
-
-    def tiny_crop(img):
-        N, C, H, W = img.shape
-        pad = max(1, int(0.02 * H * strength))  # tiny crop
-        top = random.randint(0, pad)
-        left = random.randint(0, pad)
-        newH = H - random.randint(0, pad)
-        newW = W - random.randint(0, pad)
-        newH = max(2, newH)
-        newW = max(2, newW)
-        cropped = img[..., top:newH, left:newW]
-        return F.interpolate(cropped, size=(H, W), mode="bilinear", align_corners=False).clamp(0, 1)
-
-    def subpixel_shift(img):
-        N, C, H, W = img.shape
-        dx = 0.5 * strength * random.choice([-1, 1])
-        dy = 0.5 * strength * random.choice([-1, 1])
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=img.device),
-            torch.linspace(-1, 1, W, device=img.device),
-            indexing="ij",
-        )
-        grid = torch.stack((grid_x + dx / W, grid_y + dy / H), dim=-1)
-        grid = grid.unsqueeze(0).expand(N, H, W, 2)
-        return F.grid_sample(img, grid, align_corners=True)
-
-    ops = [jpeg_like, gauss_noise, blur, brightness, tiny_crop, subpixel_shift]
-
-    k = random.randint(1, 3)
-    out = x
-    for f in random.sample(ops, k=k):
-        out = f(out)
-    return out
-'''
-
 # -----------------------------
 # Utils
 # -----------------------------
@@ -339,6 +270,13 @@ def main():
         train_set = CustomImageFolder(args.data_dir, transform=transform_train)
         print(f"[Data] Using flat-folder dataset: {len(train_set)} images")
 
+    # ---------------------------------------------
+    # Per-perturbation tamper loss tracking
+    # ---------------------------------------------
+    perturb_names = ["jpeg_like", "gauss_noise", "blur", "brightness", "tiny_crop", "subpixel_shift"]
+    # history[name][epoch_idx] = avg tamper BCE for that epoch (or NaN if unused)
+    perturb_history = {name: [] for name in perturb_names}
+
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
@@ -373,20 +311,6 @@ def main():
     #encoder.train()
     #decoder.train()
 
-    encoder = models.StegaStampEncoder(
-        args.image_resolution,
-        IMAGE_CHANNELS,
-        args.bit_length,
-        return_residual=False,
-    )
-    decoder = models.StegaStampDecoder(
-        args.image_resolution,
-        IMAGE_CHANNELS,
-        args.bit_length,
-    )
-    encoder = encoder.to(device)
-    decoder = decoder.to(device)
-
     # Helper to freeze/unfreeze decoder params
     def set_decoder_trainable(dec, trainable: bool):
         for p in dec.parameters():
@@ -414,6 +338,11 @@ def main():
         epoch_loss_sum = 0.0
         epoch_bit_acc_sum = 0.0
         epoch_batches = 0
+
+        # FOR EACH PERTURBATION: per-epoch sums and counts 
+        epoch_pert_sums = {name: 0.0 for name in perturb_names}
+        epoch_pert_counts = {name: 0 for name in perturb_names}
+
 
         # minimum warmup before fragility can activate
         MIN_WARMUP_STEPS = 1000  # You can tune this (500–2000 for CIFAR10)
@@ -458,15 +387,22 @@ def main():
             tampered_images = perturbation_bank(
                 fingerprinted_images,
                 strength=args.aug_strength,
+                return_ops=True,           # log per-op tamper loss
             )
             decoder_output_tam = decoder(tampered_images)
-
+            
             BCE_loss_tam = bce_logits(
                 decoder_output_tam.view(-1),
-                fingerprints.view(-1),   # target = TRUE watermark bits
+                fingerprints.view(-1),      # target = TRUE watermark bits
             )
 
-             # ----- clean bitwise accuracy (used for schedules + fragility switch) -----
+            tam_loss_val = BCE_loss_tam.item()
+            for op_name in used_ops:
+                if ip_name in epoch_pert_sums:
+                    epoch_pert_sims[op_name] += tam_loss_val
+                    epoch_pert_counts[op_name] += 1
+
+            # ----- clean bitwise accuracy (used for schedules + fragility switch) -----
             fingerprints_predicted = (decoder_output_clean > 0).float()
             bitwise_accuracy = 1.0 - torch.mean(torch.abs(fingerprints - fingerprints_predicted))
 
@@ -570,13 +506,57 @@ def main():
                     f.write(str(global_step))
             '''
 
-            # ---- end-of-epoch summary ----
+            # ---- end-of-each-epoch summary ----
             avg_epoch_loss = epoch_loss_sum / max(1, epoch_batches)
             avg_epoch_bit_acc = epoch_bit_acc_sum / max(1, epoch_batches)
             print(
                 f"[Train] Finished epoch {i_epoch + 1}/{args.num_epochs} | "
                 f"avg_loss={avg_epoch_loss:.4f} | "
                 f"avg_bitwise_acc={avg_epoch_bit_acc:.4f}")
+
+    # ---------------------------------------------
+    # End of epoch: compute avg tamper loss per perturbation
+    # ---------------------------------------------
+    for name in perturb_names:
+        if epoch_pert_counts[name] > 0:
+            avg_loss = epoch_pert_sums[name] / epoch_pert_counts[name]
+        else:
+            avg_loss = float("nan")
+        perturb_history[name].append(avg_loss)
+
+
+    # ---------------------------------------------
+    # Final ASCII summary of tamper loss per perturbation per epoch
+    # ---------------------------------------------
+    print("\n================ Tamper BCE per Perturbation per Epoch ================")
+
+    # Header
+    header_cols = ["Perturbation"] + [f"ep{e+1}" for e in range(args.num_epochs)]
+    col_widths = [max(len(h), 12)] + [8] * args.num_epochs
+
+    def fmt_cell(text, width):
+        return str(text).rjust(width)
+
+    # Print Header
+    header_str = " | ".join(fmt_cell(h, w) for h, w in zip(header_cols, col_widths))
+    print(header_str)
+    print("-" * len(header_str))
+
+    # Print each row
+    for name in perturb_names:
+        row = [name]
+        for epoch_idx in range(args.num_epochs):
+            val = perturb_history[name][epoch_idx]
+            if val != val:  # NaN check
+                cell = "  n/a"
+            else:
+                cell = f"{val:.3f}"
+            row.append(cell)
+
+        row_str = " | ".join(fmt_cell(c, w) for c, w in zip(row, col_widths))
+        print(row_str)
+
+    print("=====================================================================\n")
 
     # ----- final save so _last always updates -----
     torch.save(decoder_encoder_optim.state_dict(), join(CHECKPOINTS_PATH, f"{EXP_NAME}_optim_last.pth"))
