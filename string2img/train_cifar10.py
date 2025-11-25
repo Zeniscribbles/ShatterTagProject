@@ -43,7 +43,7 @@ import torchvision.transforms.functional as TF
 from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10
-from cifar10_perturbation_bank import perturbation_bank
+import cifar10_perturbation_bank
 
 
 # from torchvision.datasets import ImageFolder
