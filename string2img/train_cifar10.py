@@ -515,15 +515,15 @@ def main():
                 f"avg_loss={avg_epoch_loss:.4f} | "
                 f"avg_bitwise_acc={avg_epoch_bit_acc:.4f}")
 
-    # ---------------------------------------------
-    # End of epoch: compute avg tamper loss per perturbation
-    # ---------------------------------------------
-    for name in perturb_names:
-        if epoch_pert_counts[name] > 0:
-            avg_loss = epoch_pert_sums[name] / epoch_pert_counts[name]
-        else:
-            avg_loss = float("nan")
-        perturb_history[name].append(avg_loss)
+            # ---------------------------------------------
+            # End of epoch: compute avg tamper loss per perturbation
+            # ---------------------------------------------
+            for name in perturb_names:
+                if epoch_pert_counts[name] > 0:
+                    avg_loss = epoch_pert_sums[name] / epoch_pert_counts[name]
+                else:
+                    avg_loss = float("nan")
+                perturb_history[name].append(avg_loss)
 
 
     # ---------------------------------------------
