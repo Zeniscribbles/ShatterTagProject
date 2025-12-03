@@ -384,7 +384,8 @@ def main():
             )
 
             # ----- tamper path: attack only the encoded image -----
-            tampered_images = perturbation_bank(
+            # Unpack the tuple into tampered_images AND used_ops
+            tampered_images, used_ops = perturbation_bank(
                 fingerprinted_images,
                 strength=args.aug_strength,
                 return_ops=True,           # log per-op tamper loss
@@ -398,8 +399,8 @@ def main():
 
             tam_loss_val = BCE_loss_tam.item()
             for op_name in used_ops:
-                if ip_name in epoch_pert_sums:
-                    epoch_pert_sims[op_name] += tam_loss_val
+                if op_name in epoch_pert_sums:
+                    epoch_pert_sums[op_name] += tam_loss_val
                     epoch_pert_counts[op_name] += 1
 
             # ----- clean bitwise accuracy (used for schedules + fragility switch) -----
