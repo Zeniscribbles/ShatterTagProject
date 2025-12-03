@@ -533,7 +533,12 @@ def main():
 
     # Header
     header_cols = ["Perturbation"] + [f"ep{e+1}" for e in range(args.num_epochs)]
-    col_widths = [max(len(h), 12)] + [8] * args.num_epochs
+    
+    max_name_len = max([len(n) for n in perturb_names] + [len("Perturbation")])
+    first_col_width = max(max_name_len, 12)
+
+    # Build the widths list: First column is dynamic, the rest are fixed at 8 chars
+    col_widths = [first_col_width] + [8] * args.num_epochs
 
     def fmt_cell(text, width):
         return str(text).rjust(width)
